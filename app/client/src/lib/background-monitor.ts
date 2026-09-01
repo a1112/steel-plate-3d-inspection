@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import type { AcquisitionMode } from './acquisition-mode';
 import {
   fetchProductionStatus,
   fetchProductionTasks,
@@ -316,6 +317,50 @@ export async function readServiceSupervisorSnapshot(
     signal,
   });
   return readSupervisorResponse<BackgroundMonitorSnapshot>(response);
+}
+
+export function supervisorAppliedAcquisitionMode(
+  snapshot: BackgroundMonitorSnapshot,
+  acquisitionMode: AcquisitionMode,
+) {
+  const services = snapshot.services ?? [];
+  return services.length > 0
+    && services.every((service) => service.acquisitionMode === acquisitionMode)
+    && services
+      .filter((service) => service.required && service.enabledForMode !== false)
+      .every((service) => service.ok);
+}
+
+export async function waitForSupervisorAcquisitionMode(
+  acquisitionMode: AcquisitionMode,
+  options: { signal?: AbortSignal; timeoutMs?: number; pollIntervalMs?: number } = {},
+) {
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const pollIntervalMs = options.pollIntervalMs ?? 750;
+  const deadline = Date.now() + timeoutMs;
+  let lastSnapshot: BackgroundMonitorSnapshot | null = null;
+  while (Date.now() <= deadline) {
+    if (options.signal?.aborted) throw new DOMException('模式切换状态读取已取消', 'AbortError');
+    lastSnapshot = await readServiceSupervisorSnapshot(options.signal);
+    if (supervisorAppliedAcquisitionMode(lastSnapshot, acquisitionMode)) return lastSnapshot;
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        globalThis.clearTimeout(timer);
+        reject(new DOMException('模式切换状态读取已取消', 'AbortError'));
+      };
+      const timer = globalThis.setTimeout(() => {
+        options.signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, pollIntervalMs);
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+  const pending = (lastSnapshot?.services ?? [])
+    .filter((service) => service.acquisitionMode !== acquisitionMode || (service.required && !service.ok))
+    .map((service) => service.name || service.id)
+    .slice(0, 4)
+    .join('、');
+  throw new Error(pending ? `等待运行模式切换超时：${pending}` : '等待运行模式切换超时');
 }
 
 export async function controlServiceSupervisor(

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { FolderOpen } from 'lucide-react';
 import {
   fetchAdminBkvImportJobs,
   fetchAdminRuntimeProfile,
@@ -9,12 +10,43 @@ import {
   type AdminRuntimeProfileState,
   type BkvImportStatus,
   type RuntimeProfileDocument,
+  type RuntimeSimulationConfig,
 } from '../services/runtime-profile-api';
+import {
+  acquisitionModeDetail,
+  acquisitionModeLabel,
+  acquisitionModeOptions,
+  isAcquisitionMode,
+  type AcquisitionMode,
+} from '../lib/acquisition-mode';
+import { chooseCaptureLocalDirectory } from '../lib/capture-api';
+import { waitForSupervisorAcquisitionMode } from '../lib/background-monitor';
 import { Panel } from './Panel';
 
 type RuntimeProfileManagementPanelProps = {
   canEdit: boolean;
 };
+
+const DEFAULT_SIMULATION_CONFIG: RuntimeSimulationConfig = {
+  sourceRoot: '',
+  speed: 1,
+  loop: false,
+  interSessionGapMs: 1_500,
+};
+
+function profileAcquisitionMode(profile: Pick<RuntimeProfileDocument, 'acquisitionMode' | 'dataSource' | 'provider' | 'cameraConnection'>): AcquisitionMode {
+  if (isAcquisitionMode(profile.acquisitionMode)) return profile.acquisitionMode;
+  if (profile.dataSource === 'converted-local') return 'offline';
+  if (profile.provider === 'simulated' || profile.cameraConnection === 'simulated') return 'simulation';
+  return 'online';
+}
+
+function supportsCapturePipelineModes(profile: Pick<RuntimeProfileDocument, 'provider' | 'cameraConnection' | 'capabilities'>) {
+  return profile.provider === 'external-api'
+    && profile.cameraConnection === 'headless-cpp'
+    && profile.capabilities.directCamera
+    && profile.capabilities.captureManagement;
+}
 
 function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback;
@@ -67,6 +99,49 @@ export function RuntimeProfileManagementPanel({
     } : current);
   };
 
+  const updateAcquisitionMode = (acquisitionMode: AcquisitionMode) => {
+    setDraft((current) => {
+      if (!current) return current;
+      if (acquisitionMode !== 'offline' && !supportsCapturePipelineModes(current)) {
+        setMessage('当前站点无六相机采集管线，请切换或配置 SICK 站点');
+        return current;
+      }
+      return {
+        ...current,
+        acquisitionMode,
+        ...(acquisitionMode === 'simulation' && !current.simulation
+          ? { simulation: DEFAULT_SIMULATION_CONFIG }
+          : {}),
+      };
+    });
+  };
+
+  const updateSimulation = <K extends keyof RuntimeSimulationConfig>(key: K, value: RuntimeSimulationConfig[K]) => {
+    setDraft((current) => current ? {
+      ...current,
+      simulation: {
+        ...(current.simulation ?? DEFAULT_SIMULATION_CONFIG),
+        [key]: value,
+      },
+    } : current);
+  };
+
+  const chooseSimulationSource = async () => {
+    try {
+      const selected = await chooseCaptureLocalDirectory('选择模拟采集数据目录');
+      if (!selected) {
+        setMessage('浏览器模式不能选择本机目录，请手工填写采集主机路径');
+        return;
+      }
+      if (selected.selected && selected.path) {
+        updateSimulation('sourceRoot', selected.path);
+        setMessage(`已选择模拟数据目录：${selected.path}`);
+      }
+    } catch (error) {
+      setMessage(errorMessage(error, '模拟数据目录选择失败'));
+    }
+  };
+
   const validateProfile = async () => {
     if (!draft) return;
     setBusyAction('validate');
@@ -86,17 +161,66 @@ export function RuntimeProfileManagementPanel({
 
   const saveProfile = async () => {
     if (!draft) return;
+    const savedDraft = draft;
+    const acquisitionMode = profileAcquisitionMode(savedDraft);
     setBusyAction('save');
     setMessage('');
     try {
-      const result = await saveAdminRuntimeProfile(draft);
+      const result = await saveAdminRuntimeProfile(savedDraft);
       setProfileState((current) => current ? {
         ...current,
-        savedProfile: draft,
+        savedProfile: savedDraft,
         savedConfigHash: result.savedConfigHash,
         restartRequired: result.restartRequired,
       } : current);
-      setMessage(result.restartRequired ? '配置已保存，重启后生效' : '配置已保存');
+      if (!result.modeTransitionAccepted) {
+        setMessage(result.restartRequired
+          ? '配置已保存；非模式配置将在下次运行服务重启后生效'
+          : '配置已保存，当前运行服务无需切换');
+        return;
+      }
+      const targetMode = result.targetAcquisitionMode;
+      setMessage(result.recoveryRequired
+        ? `配置已保存，模式提交正在恢复并切换至${acquisitionModeLabel(targetMode)}…`
+        : `配置已保存，服务端正在自动切换至${acquisitionModeLabel(targetMode)}…`);
+      try {
+        await waitForSupervisorAcquisitionMode(targetMode);
+        setProfileState((current) => current ? {
+          ...current,
+          activeProfile: {
+            ...current.activeProfile,
+            profileId: savedDraft.id,
+            displayName: savedDraft.displayName,
+            provider: savedDraft.provider,
+            dataSource: savedDraft.dataSource,
+            cameraConnection: savedDraft.cameraConnection,
+            cameraCount: savedDraft.cameraCount,
+            cameras: savedDraft.cameras,
+            capabilities: {
+              ...savedDraft.capabilities,
+              directCamera: targetMode === 'online' && savedDraft.capabilities.directCamera,
+              captureManagement: targetMode !== 'offline' && savedDraft.capabilities.captureManagement,
+              reconstruction: targetMode !== 'offline' && savedDraft.capabilities.reconstruction,
+              offlineReplay: targetMode !== 'online' || savedDraft.capabilities.offlineReplay,
+            },
+            acquisitionMode: targetMode,
+            simulation: targetMode === 'simulation' && savedDraft.simulation ? {
+              configured: Boolean(savedDraft.simulation.sourceRoot.trim()),
+              speed: savedDraft.simulation.speed,
+              loop: savedDraft.simulation.loop,
+              interSessionGapMs: savedDraft.simulation.interSessionGapMs,
+            } : undefined,
+            configHash: result.savedConfigHash,
+          },
+          activeConfigHash: result.savedConfigHash,
+          restartRequired: false,
+        } : current);
+        setMessage(`已应用${acquisitionModeLabel(targetMode)}，运行服务切换完成`);
+      } catch (error) {
+        setMessage(result.recoveryRequired
+          ? `配置已保存，但模式提交恢复尚未完成：${errorMessage(error, '暂未确认恢复结果')}`
+          : `配置已保存，服务端仍在自动切换：${errorMessage(error, '暂未确认切换结果')}`);
+      }
     } catch (error) {
       setMessage(errorMessage(error, '运行配置保存失败'));
     } finally {
@@ -139,10 +263,20 @@ export function RuntimeProfileManagementPanel({
   };
 
   const activeProfile = profileState?.activeProfile;
+  const activeAcquisitionMode = activeProfile
+    ? (isAcquisitionMode(activeProfile.acquisitionMode)
+      ? activeProfile.acquisitionMode
+      : activeProfile.dataSource === 'converted-local'
+        ? 'offline'
+        : activeProfile.provider === 'simulated' || activeProfile.cameraConnection === 'simulated'
+          ? 'simulation'
+          : 'online')
+    : 'online';
   const latestJob = importStatus?.latestJob;
   const converted = latestJob?.convertedRecords ?? 0;
   const total = latestJob?.totalRecords ?? 0;
   const quarantined = latestJob?.quarantinedRecords ?? 0;
+  const capturePipelineModesAvailable = draft ? supportsCapturePipelineModes(draft) : false;
 
   return (
     <div className="runtime-profile-management" data-testid="runtime-profile-management">
@@ -156,7 +290,7 @@ export function RuntimeProfileManagementPanel({
               <div>
                 <span>当前运行模式</span>
                 <strong>{activeProfile.displayName}</strong>
-                <em>{activeProfile.provider} / {activeProfile.dataSource}</em>
+                <em>{acquisitionModeLabel(activeAcquisitionMode)} · {activeProfile.provider} / {activeProfile.dataSource}</em>
               </div>
               <div>
                 <span>相机布局</span>
@@ -174,8 +308,103 @@ export function RuntimeProfileManagementPanel({
             </div>
 
             {profileState.restartRequired ? (
-              <div className="runtime-profile-restart-notice">已保存新配置，需要重启服务后生效</div>
+              <div className="runtime-profile-restart-notice">
+                <span>
+                  {profileAcquisitionMode(profileState.savedProfile) !== activeAcquisitionMode
+                    ? '已保存新模式；服务端监控正在自动切换运行服务，无需手工逐项重启'
+                    : '已保存非模式配置，将在下次运行服务重启后生效'}
+                </span>
+              </div>
             ) : null}
+
+            <section className="runtime-acquisition-mode" aria-label="采集运行模式配置">
+              <header>
+                <div>
+                  <span>采集运行模式</span>
+                  <strong>{acquisitionModeLabel(profileAcquisitionMode(draft))}</strong>
+                </div>
+                <em>{acquisitionModeDetail(profileAcquisitionMode(draft))}</em>
+              </header>
+              <div className="runtime-acquisition-mode-options" role="radiogroup" aria-label="采集运行模式">
+                {acquisitionModeOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={profileAcquisitionMode(draft) === option.value}
+                    className={profileAcquisitionMode(draft) === option.value ? 'active' : ''}
+                    disabled={!canEdit || Boolean(busyAction) || (option.value !== 'offline' && !capturePipelineModesAvailable)}
+                    title={option.value !== 'offline' && !capturePipelineModesAvailable
+                      ? '当前站点无六相机采集管线，请切换或配置 SICK 站点'
+                      : undefined}
+                    onClick={() => updateAcquisitionMode(option.value)}
+                  >
+                    <strong>{option.label}</strong>
+                    <span>{option.detail}</span>
+                  </button>
+                ))}
+              </div>
+              {!capturePipelineModesAvailable ? (
+                <div className="runtime-acquisition-mode-note" role="status">
+                  当前站点无六相机采集管线，请切换或配置 SICK 站点；此站点仅支持离线（历史模式）。
+                </div>
+              ) : null}
+              {profileAcquisitionMode(draft) === 'simulation' ? (
+                <div className="runtime-simulation-form" data-testid="runtime-simulation-form">
+                  <label className="runtime-simulation-source">
+                    <span>模拟数据目录</span>
+                    <div>
+                      <input
+                        aria-label="模拟数据目录"
+                        value={draft.simulation?.sourceRoot ?? ''}
+                        disabled={!canEdit}
+                        placeholder="例如 H:\\captured-data"
+                        onChange={(event) => updateSimulation('sourceRoot', event.target.value)}
+                      />
+                      <button type="button" aria-label="选择模拟数据目录" disabled={!canEdit} onClick={() => void chooseSimulationSource()}>
+                        <FolderOpen size={15} />
+                      </button>
+                    </div>
+                  </label>
+                  <label>
+                    <span>播放速度</span>
+                    <input
+                      aria-label="模拟播放速度"
+                      type="number"
+                      min={0.25}
+                      max={4}
+                      step={0.25}
+                      value={draft.simulation?.speed ?? DEFAULT_SIMULATION_CONFIG.speed}
+                      disabled={!canEdit}
+                      onChange={(event) => updateSimulation('speed', Number(event.target.value))}
+                    />
+                  </label>
+                  <label>
+                    <span>批次间隔</span>
+                    <input
+                      aria-label="模拟批次间隔毫秒"
+                      type="number"
+                      min={1_001}
+                      max={3_600_000}
+                      step={100}
+                      value={draft.simulation?.interSessionGapMs ?? DEFAULT_SIMULATION_CONFIG.interSessionGapMs}
+                      disabled={!canEdit}
+                      onChange={(event) => updateSimulation('interSessionGapMs', Number(event.target.value))}
+                    />
+                  </label>
+                  <label className="runtime-simulation-loop">
+                    <input
+                      aria-label="模拟循环播放"
+                      type="checkbox"
+                      checked={draft.simulation?.loop ?? DEFAULT_SIMULATION_CONFIG.loop}
+                      disabled={!canEdit}
+                      onChange={(event) => updateSimulation('loop', event.target.checked)}
+                    />
+                    <span>数据集结束后循环播放</span>
+                  </label>
+                </div>
+              ) : null}
+            </section>
 
             <div className="runtime-profile-camera-grid" aria-label="运行模式相机列表">
               {draft.cameras

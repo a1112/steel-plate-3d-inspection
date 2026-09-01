@@ -10,6 +10,7 @@ import { NotificationCenter } from './NotificationCenter';
 import { TopNav, type NavKey } from './TopNav';
 import { WindowControls } from './WindowControls';
 import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
+import { acquisitionModeLabel } from '../lib/acquisition-mode';
 
 export type BkvDataHealth =
   | { state: 'loading'; detail: string }
@@ -46,6 +47,7 @@ interface BrandHeaderProps {
 
 const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
   kind: 'direct',
+  acquisitionMode: 'online',
   cameraCount: 8,
   requestsOnlineServices: true,
   requestsStandardRecords: false,
@@ -53,6 +55,12 @@ const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
   showsCaptureManagement: true,
   showsReconstruction: true,
   supportsOfflineReplay: false,
+  acquisitionDisabled: false,
+  allowsAcquisitionWrites: true,
+  readOnly: false,
+  usesPhysicalHardware: true,
+  usesSimulationSource: false,
+  allowsProductionWrites: true,
 };
 
 type ServiceConnectionState = 'online' | 'warning' | 'offline';
@@ -90,6 +98,12 @@ function serviceStatusTone(state: ServiceConnectionState) {
     return 'warning';
   }
   return 'error';
+}
+
+function simulationProgressPercent(progress: number | undefined) {
+  if (typeof progress !== 'number' || !Number.isFinite(progress)) return 0;
+  const percent = progress <= 1 ? progress * 100 : progress;
+  return Math.max(0, Math.min(100, percent));
 }
 
 function makeUnknownService(name: string): ServiceStatusPanelItem {
@@ -926,14 +940,14 @@ export function BrandHeader({
       </div>
 
       <div className="title-meta-group">
-        <TopNav active={activeNav} onChange={onNavChange} embedded />
+        <TopNav active={activeNav} onChange={onNavChange} acquisitionMode={dashboardMode.acquisitionMode} embedded />
         <div className="system-title">{systemName}</div>
       </div>
 
-      <div className={`brand-status ${dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
+      <div className={`brand-status runtime-status-${dashboardMode.acquisitionMode} ${dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online' ? 'bkv-runtime-status' : 'online-runtime-status'}`}>
         {dashboardMode.kind === 'bkv' ? (
           <>
-            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线回放" title={bkvHealth.detail} />
+            <StatusBlock className="bkv-mode-status" label="BKV 模式" value="离线" title={`BKV 离线回放 · ${bkvHealth.detail}`} />
             <StatusBlock className="bkv-data-status" label="离线数据" value={`${bkvData?.availableCameraCount ?? 0}/${bkvData?.cameraCount ?? dashboardMode.cameraCount}`} title={bkvHealth.detail} />
             <StatusBlock className="bkv-batch-status" label="批次" value={bkvData?.batchId ?? '读取中'} title={bkvData?.batchId} />
             <StatusBlock
@@ -969,6 +983,33 @@ export function BrandHeader({
               <span>数据转换</span>
               <strong className={bkvHealthTone}>{bkvHealthValue}</strong>
             </button>
+          </>
+        ) : dashboardMode.acquisitionMode === 'offline' ? (
+          <>
+            <StatusBlock label="运行模式" value={acquisitionModeLabel('offline')} tone="warning" title="历史浏览，采集已禁用" />
+            <StatusBlock label="业务数据" value="历史浏览" title="检测记录、缺陷、复核和报告业务保持可用" />
+            <StatusBlock label="配置通道" value={`${dashboardMode.cameraCount}`} title="离线模式不连接这些物理相机" />
+            <StatusBlock label="采集服务" value="已禁用" title="离线模式不会启动采集或生产控制" />
+          </>
+        ) : dashboardMode.acquisitionMode === 'simulation' ? (
+          <>
+            <StatusBlock label="运行模式" value={acquisitionModeLabel('simulation')} tone="warning" title="使用已采集数据模拟生产采集流程" />
+            <StatusBlock
+              label="模拟数据"
+              value={capture?.health && 'simulation' in capture.health && capture.health.simulation?.sourceAvailable ? '已就绪' : '待检查'}
+              title={capture?.health && 'simulation' in capture.health ? capture.health.simulation?.sourceRoot : undefined}
+            />
+            <StatusBlock
+              label="模拟通道"
+              value={`${capture?.health && 'simulation' in capture.health ? capture.health.simulation?.channels.length ?? 0 : 0}/${dashboardMode.cameraCount}`}
+              title="模拟通道不会计入物理相机在线数量"
+            />
+            <StatusBlock
+              label="模拟进度"
+              value={capture?.health && 'simulation' in capture.health && capture.health.simulation
+                ? `${Math.round(simulationProgressPercent(capture.health.simulation.progress))}%`
+                : '待启动'}
+            />
           </>
         ) : (
           <>
@@ -1070,7 +1111,7 @@ export function BrandHeader({
           <Activity size={13} />
         </div>
         <NotificationCenter embedded />
-        <WindowControls analysisCollapse={dashboardMode.kind === 'direct' ? analysisCollapse : undefined} />
+        <WindowControls analysisCollapse={dashboardMode.kind === 'direct' && dashboardMode.acquisitionMode !== 'offline' ? analysisCollapse : undefined} />
       </div>
     </header>
   );

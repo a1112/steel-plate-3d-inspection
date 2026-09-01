@@ -2,6 +2,7 @@ import { Activity, ClipboardCheck, Cpu, Factory, Gauge, LoaderCircle, Monitor, P
 import { useState, type ChangeEvent, type ElementType } from 'react';
 import type { ThemeMode, ThemeStyle } from '../data/inspection';
 import { openParameterManagementWindow } from '../lib/app-windows';
+import { connectionModeLabel } from '../lib/connection-mode';
 import { isWebHostedRuntime, type ConnectionConfig, type ConnectionMode, type DiscoveredInspectionService } from '../services/inspection-api';
 import type { InspectionSettings, SettingsErrors } from '../state/operations';
 import { Panel } from './Panel';
@@ -12,7 +13,7 @@ export type SettingsSection = 'theme' | 'connection' | 'grading' | 'acquisition'
 
 const settingsSections: Array<{ id: SettingsSection; label: string; hint: string; icon: ElementType }> = [
   { id: 'theme', label: '主题外观', hint: '界面配色与显示风格', icon: Palette },
-  { id: 'connection', label: '连接设置', hint: '在线/演示与服务端地址', icon: Server },
+  { id: 'connection', label: '连接设置', hint: '在线 API / 开发假数据', icon: Server },
   { id: 'grading', label: '缺陷判级', hint: '严重、复核与尺寸阈值', icon: Gauge },
   { id: 'acquisition', label: '采集联机', hint: '相机、编码器与归档', icon: RadioTower },
   { id: 'status', label: '参数状态', hint: '保存、应用与恢复', icon: ClipboardCheck },
@@ -245,12 +246,12 @@ export function SettingsPage({
 
           {activeSection === 'connection' ? (
             <Panel title="连接设置" className="settings-panel">
-              <div className="connection-mode-toggle" role="group" aria-label="数据模式">
+              <div className="connection-mode-toggle" role="group" aria-label="开发服务连接模式">
                 <button type="button" className={connection.mode === 'online' ? 'active' : ''} onClick={() => setConnectionMode('online')}>
-                  在线模式
+                  {connectionModeLabel('online')}
                 </button>
                 <button type="button" className={connection.mode === 'demo' ? 'active' : ''} onClick={() => setConnectionMode('demo')}>
-                  演示模式
+                  {connectionModeLabel('demo')}
                 </button>
               </div>
               {webHosted ? (
@@ -350,11 +351,11 @@ export function SettingsPage({
               <dl className="settings-summary">
                 <div>
                   <dt>当前模式</dt>
-                  <dd>{connection.mode === 'online' ? '在线模式' : '演示模式'}</dd>
+                  <dd>{connectionModeLabel(connection.mode)}</dd>
                 </div>
                 <div>
                   <dt>数据来源</dt>
-                  <dd>{connection.mode === 'online' ? `${(connection.runtime?.databaseEngine || '服务端').toUpperCase()} 数据库` : '客户端内置演示数据'}</dd>
+                  <dd>{connection.mode === 'online' ? `${(connection.runtime?.databaseEngine || '服务端').toUpperCase()} 数据库` : '客户端内置假数据（非采集模拟）'}</dd>
                 </div>
                 <div>
                   <dt>服务端地址</dt>

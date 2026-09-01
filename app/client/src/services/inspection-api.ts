@@ -8,6 +8,7 @@ import type {
   DefectGroups,
   DefectItem,
   DefectReviewStatus,
+  InspectionSourceEvidence,
   InspectionSnapshot,
   PlateInspection,
 } from '../data/inspection';
@@ -305,6 +306,8 @@ export type AdminRuntimeService = {
   } | null;
   operations?: AdminRuntimeServiceOperation[];
   control?: AdminRuntimeServiceControl | null;
+  enabledForMode?: boolean;
+  acquisitionMode?: 'online' | 'offline' | 'simulation' | string;
   reason?: string | null;
 };
 
@@ -666,7 +669,7 @@ export type AdminSecurityPolicyInput = {
   };
 };
 
-export type AdminInspectionRecord = {
+export type AdminInspectionRecord = InspectionSourceEvidence & {
   id: string;
   time: string;
   plateNo: string;
@@ -845,7 +848,7 @@ export type ProductionMaterialSession = {
   updatedAt: string;
 };
 
-export type ProductionInspection = {
+export type ProductionInspection = InspectionSourceEvidence & {
   id: string;
   materialId: string;
   sessionId: string;

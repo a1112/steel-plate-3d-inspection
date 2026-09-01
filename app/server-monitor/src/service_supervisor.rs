@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -14,7 +15,11 @@ use std::os::windows::process::CommandExt;
 const MAX_EVENTS: usize = 240;
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(350);
 const RESTART_BACKOFF: Duration = Duration::from_secs(3);
+const MAX_CONSECUTIVE_START_FAILURES: u32 = 5;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const RUNTIME_MODE_COMMIT_PATH: &str = "config/runtime-mode-commit.json";
+const RUNTIME_MODE_RELEASE_DELAY_MILLIS: u64 = 5_000;
+const RUNTIME_MODE_STALE_FENCE_MILLIS: u64 = 120_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -87,6 +92,10 @@ struct ServiceRegistration {
     #[serde(default)]
     required: bool,
     #[serde(default)]
+    enabled_when_modes: Vec<String>,
+    #[serde(default)]
+    required_when_modes: Vec<String>,
+    #[serde(default)]
     lifecycle: String,
     #[serde(default)]
     process: Option<ProcessDefinition>,
@@ -105,6 +114,447 @@ struct RegistryFile {
     schema: String,
     version: u32,
     services: Vec<ServiceRegistration>,
+}
+
+fn normalize_acquisition_mode(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "online" => Some("online"),
+        "offline" => Some("offline"),
+        "simulation" | "simulated" | "replay" => Some("simulation"),
+        _ => None,
+    }
+}
+
+fn runtime_value_acquisition_mode(runtime: &Value) -> String {
+    if let Some(mode) = runtime
+        .get("acquisitionMode")
+        .and_then(Value::as_str)
+        .and_then(normalize_acquisition_mode)
+    {
+        return mode.to_string();
+    }
+    let provider = runtime
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if provider.eq_ignore_ascii_case("simulated") {
+        "simulation".to_string()
+    } else if provider.eq_ignore_ascii_case("bkv")
+        || runtime
+            .get("cameraConnection")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+    {
+        "offline".to_string()
+    } else {
+        "online".to_string()
+    }
+}
+
+fn mode_list_contains(values: &[String], mode: &str) -> bool {
+    values
+        .iter()
+        .filter_map(|value| normalize_acquisition_mode(value))
+        .any(|value| value == mode)
+}
+
+fn service_enabled_for_mode(registration: &ServiceRegistration, mode: &str) -> bool {
+    registration.enabled_when_modes.is_empty()
+        || mode_list_contains(&registration.enabled_when_modes, mode)
+}
+
+fn service_required_for_mode(registration: &ServiceRegistration, mode: &str) -> bool {
+    registration.required
+        && service_enabled_for_mode(registration, mode)
+        && (registration.required_when_modes.is_empty()
+            || mode_list_contains(&registration.required_when_modes, mode))
+}
+
+fn resolve_config_reference(workspace_root: &Path, base: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+    let workspace_candidate = workspace_root.join(&path);
+    if workspace_candidate.exists() {
+        workspace_candidate
+    } else {
+        base.join(path)
+    }
+}
+
+fn write_supervisor_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "目标路径缺少父目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| format!("目标目录创建失败：{error}"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "目标文件名无效".to_string())?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", unix_time_millis()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| format!("临时文件创建失败：{error}"))?;
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|error| format!("临时文件写入失败：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("临时文件刷盘失败：{error}"))?;
+        drop(file);
+        replace_supervisor_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_supervisor_file(source: &Path, target: &Path) -> Result<(), String> {
+    fs::rename(source, target).map_err(|error| format!("原子发布失败：{error}"))
+}
+
+#[cfg(windows)]
+fn replace_supervisor_file(source: &Path, target: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let target = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(format!("原子发布失败：{}", std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn validated_staged_runtime_profile(
+    workspace_root: &Path,
+    relative: &str,
+) -> Result<PathBuf, String> {
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || !relative.starts_with(Path::new("config/runtime-mode-staging"))
+    {
+        return Err("运行模式暂存路径越界".to_string());
+    }
+    let canonical_root =
+        fs::canonicalize(workspace_root).map_err(|error| format!("工作目录不可用：{error}"))?;
+    let candidate = fs::canonicalize(workspace_root.join(relative))
+        .map_err(|error| format!("运行模式暂存文件不可用：{error}"))?;
+    if !candidate.starts_with(&canonical_root) || !candidate.is_file() {
+        return Err("运行模式暂存文件越界或不是普通文件".to_string());
+    }
+    Ok(candidate)
+}
+
+fn configured_acquisition_mode(workspace_root: &Path) -> Result<String, String> {
+    let project_path = workspace_root.join("config/project.json");
+    let project = fs::read_to_string(&project_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let Some(project) = project else {
+        return Ok("online".to_string());
+    };
+    let project_root = project_path.parent().unwrap_or(workspace_root);
+    let runtime_path = if let Some(site_reference) = project
+        .get("activeSiteConfig")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let site_path =
+            resolve_config_reference(workspace_root, project_root, site_reference.trim());
+        let site = fs::read_to_string(&site_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        site.and_then(|site| {
+            let runtime = site.get("runtimeProfile")?.as_str()?.trim();
+            let base = site_path.parent().unwrap_or(project_root);
+            Some(resolve_config_reference(workspace_root, base, runtime))
+        })
+    } else {
+        project
+            .get("activeRuntimeProfile")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| resolve_config_reference(workspace_root, project_root, value.trim()))
+    };
+    let runtime_path =
+        runtime_path.ok_or_else(|| "运行模式配置路径缺失，监督器保持已应用模式".to_string())?;
+    let runtime_bytes = fs::read(&runtime_path)
+        .map_err(|error| format!("运行模式配置读取失败，监督器保持已应用模式：{error}"))?;
+    let runtime = serde_json::from_slice::<Value>(&runtime_bytes).ok();
+    let Some(runtime) = runtime else {
+        return Err("运行模式配置无效，监督器保持已应用模式".to_string());
+    };
+    let profile_mode = runtime_value_acquisition_mode(&runtime);
+
+    let commit_path = workspace_root.join(RUNTIME_MODE_COMMIT_PATH);
+    if !commit_path.exists() {
+        return Ok(profile_mode);
+    }
+    let commit_bytes = fs::read(&commit_path)
+        .map_err(|error| format!("运行模式提交记录读取失败，监督器保持已应用模式：{error}"))?;
+    let commit = serde_json::from_slice::<Value>(&commit_bytes)
+        .map_err(|error| format!("运行模式提交记录无效，监督器保持已应用模式：{error}"))?;
+    if commit.get("schema").and_then(Value::as_str) != Some("steel.runtime-mode-commit.v1") {
+        return Err("运行模式提交记录 schema 无效，监督器保持已应用模式".to_string());
+    }
+    let committed_mode = commit
+        .get("acquisitionMode")
+        .and_then(Value::as_str)
+        .and_then(normalize_acquisition_mode)
+        .ok_or_else(|| "运行模式提交记录 mode 无效，监督器保持已应用模式".to_string())?
+        .to_string();
+    match commit.get("state").and_then(Value::as_str) {
+        // A fence is written with the currently applied mode before new profile
+        // bytes are published. Holding that mode is intentional even after the
+        // profile hash changes: revision/audit persistence has not committed yet.
+        Some("fence") => {
+            let expected_hash =
+                commit
+                    .get("profileSha256")
+                    .and_then(Value::as_str)
+                    .filter(|value| {
+                        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    });
+            let actual_hash = format!("{:x}", Sha256::digest(&runtime_bytes));
+            let fence_matches_previous = expected_hash
+                .is_some_and(|value| value.eq_ignore_ascii_case(&actual_hash))
+                && committed_mode == profile_mode;
+            let updated_at = commit
+                .get("updatedAt")
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+                })
+                .unwrap_or(u64::MAX);
+            if fence_matches_previous
+                && unix_time_millis().saturating_sub(updated_at) >= RUNTIME_MODE_STALE_FENCE_MILLIS
+            {
+                let mut recovered = commit.clone();
+                recovered["state"] = json!("committed");
+                recovered["recoveredAt"] = json!(unix_time_millis().to_string());
+                recovered["recoveryReason"] = json!("stale-fence-profile-unchanged");
+                let recovered_bytes = serde_json::to_vec_pretty(&recovered)
+                    .map_err(|error| format!("运行模式围栏恢复序列化失败：{error}"))?;
+                write_supervisor_bytes_atomic(&commit_path, &recovered_bytes).map_err(|error| {
+                    format!("运行模式围栏恢复失败，监督器保持已应用模式：{error}")
+                })?;
+            }
+            Ok(committed_mode)
+        }
+        Some("committed") => {
+            let expected_hash = commit
+                .get("profileSha256")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| {
+                    "运行模式提交记录缺少有效 profileSha256，监督器保持已应用模式".to_string()
+                })?;
+            let actual_hash = format!("{:x}", Sha256::digest(&runtime_bytes));
+            if !expected_hash.eq_ignore_ascii_case(&actual_hash) || committed_mode != profile_mode {
+                return Err(
+                    "运行模式提交记录与当前 profile 不一致，监督器保持已应用模式".to_string(),
+                );
+            }
+            Ok(committed_mode)
+        }
+        Some("ready") => {
+            let expected_hash = commit
+                .get("profileSha256")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| {
+                    "运行模式就绪记录缺少有效 profileSha256，监督器保持已应用模式".to_string()
+                })?;
+            let actual_hash = format!("{:x}", Sha256::digest(&runtime_bytes));
+            if !expected_hash.eq_ignore_ascii_case(&actual_hash) || committed_mode != profile_mode {
+                return Err(
+                    "运行模式就绪记录与当前 profile 不一致，监督器保持已应用模式".to_string(),
+                );
+            }
+            let previous_mode = commit
+                .get("previousAcquisitionMode")
+                .and_then(Value::as_str)
+                .and_then(normalize_acquisition_mode)
+                .ok_or_else(|| {
+                    "运行模式就绪记录缺少 previousAcquisitionMode，监督器保持已应用模式".to_string()
+                })?;
+            let release_after = commit
+                .get("releaseAfterMillis")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    "运行模式就绪记录缺少 releaseAfterMillis，监督器保持已应用模式".to_string()
+                })?;
+            if unix_time_millis() < release_after {
+                Ok(previous_mode.to_string())
+            } else {
+                Ok(committed_mode)
+            }
+        }
+        Some("publish") => {
+            let expected_hash = commit
+                .get("profileSha256")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| {
+                    "运行模式发布日志缺少有效 profileSha256，监督器保持已应用模式".to_string()
+                })?;
+            let staged_relative = commit
+                .get("stagedProfile")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "运行模式发布日志缺少 stagedProfile，监督器保持已应用模式".to_string()
+                })?;
+            let staged_path = validated_staged_runtime_profile(workspace_root, staged_relative)?;
+            let staged_bytes = fs::read(&staged_path)
+                .map_err(|error| format!("运行模式暂存文件读取失败：{error}"))?;
+            let staged_hash = format!("{:x}", Sha256::digest(&staged_bytes));
+            let staged_value = serde_json::from_slice::<Value>(&staged_bytes)
+                .map_err(|error| format!("运行模式暂存 JSON 无效：{error}"))?;
+            if !expected_hash.eq_ignore_ascii_case(&staged_hash)
+                || runtime_value_acquisition_mode(&staged_value) != committed_mode
+            {
+                return Err("运行模式暂存文件与发布日志不一致，监督器保持已应用模式".to_string());
+            }
+            let current_hash = format!("{:x}", Sha256::digest(&runtime_bytes));
+            if !current_hash.eq_ignore_ascii_case(expected_hash) {
+                write_supervisor_bytes_atomic(&runtime_path, &staged_bytes).map_err(|error| {
+                    format!("运行模式故障恢复发布 profile 失败，监督器保持已应用模式：{error}")
+                })?;
+            }
+            let previous_mode = commit
+                .get("previousAcquisitionMode")
+                .and_then(Value::as_str)
+                .and_then(normalize_acquisition_mode)
+                .ok_or_else(|| {
+                    "运行模式发布日志缺少 previousAcquisitionMode，监督器保持已应用模式".to_string()
+                })?;
+            let mut ready = commit.clone();
+            ready["state"] = json!("ready");
+            ready["releaseAfterMillis"] =
+                json!(unix_time_millis().saturating_add(RUNTIME_MODE_RELEASE_DELAY_MILLIS));
+            ready["updatedAt"] = json!(unix_time_millis().to_string());
+            let ready_bytes = serde_json::to_vec_pretty(&ready)
+                .map_err(|error| format!("运行模式就绪日志序列化失败：{error}"))?;
+            write_supervisor_bytes_atomic(&commit_path, &ready_bytes).map_err(|error| {
+                format!("运行模式就绪日志发布失败，监督器保持已应用模式：{error}")
+            })?;
+            let _ = fs::remove_file(staged_path);
+            Ok(previous_mode.to_string())
+        }
+        _ => Err("运行模式提交记录 state 无效，监督器保持已应用模式".to_string()),
+    }
+}
+
+fn runtime_mode_transition_hold(workspace_root: &Path) -> bool {
+    let path = workspace_root.join(RUNTIME_MODE_COMMIT_PATH);
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<Value>(&bytes) else {
+        return true;
+    };
+    if marker.get("schema").and_then(Value::as_str) != Some("steel.runtime-mode-commit.v1") {
+        return true;
+    }
+    match marker.get("state").and_then(Value::as_str) {
+        Some("committed") => {
+            marker
+                .get("acquisitionMode")
+                .and_then(Value::as_str)
+                .and_then(normalize_acquisition_mode)
+                .is_none()
+                || marker
+                    .get("profileSha256")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| {
+                        value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+        }
+        Some("fence") => true,
+        Some("ready") => marker
+            .get("releaseAfterMillis")
+            .and_then(Value::as_u64)
+            .is_none_or(|release_after| unix_time_millis() < release_after),
+        Some("publish") => true,
+        _ => true,
+    }
+}
+
+fn promote_released_runtime_mode(
+    workspace_root: &Path,
+    acquisition_mode: &str,
+) -> Result<(), String> {
+    let path = workspace_root.join(RUNTIME_MODE_COMMIT_PATH);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("运行模式就绪日志读取失败：{error}")),
+    };
+    let mut marker: Value =
+        serde_json::from_slice(&bytes).map_err(|error| format!("运行模式就绪日志无效：{error}"))?;
+    if marker.get("state").and_then(Value::as_str) == Some("committed") {
+        return Ok(());
+    }
+    if marker.get("state").and_then(Value::as_str) != Some("ready")
+        || marker
+            .get("acquisitionMode")
+            .and_then(Value::as_str)
+            .and_then(normalize_acquisition_mode)
+            != normalize_acquisition_mode(acquisition_mode)
+        || marker
+            .get("releaseAfterMillis")
+            .and_then(Value::as_u64)
+            .is_none_or(|release_after| unix_time_millis() < release_after)
+    {
+        return Err("运行模式就绪日志尚未释放或与目标模式不一致".to_string());
+    }
+    marker["state"] = json!("committed");
+    marker["committedAt"] = json!(unix_time_millis().to_string());
+    let bytes = serde_json::to_vec_pretty(&marker)
+        .map_err(|error| format!("运行模式提交日志序列化失败：{error}"))?;
+    write_supervisor_bytes_atomic(&path, &bytes)
+}
+
+fn read_applied_acquisition_mode(path: &Path) -> Option<String> {
+    let payload = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&payload).ok()?;
+    value
+        .get("acquisitionMode")
+        .and_then(Value::as_str)
+        .and_then(normalize_acquisition_mode)
+        .map(str::to_string)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -143,6 +593,8 @@ pub(crate) struct SupervisorServiceSnapshot {
     pub startup_mode: String,
     pub auto_restart: bool,
     pub managed: bool,
+    pub enabled_for_mode: bool,
+    pub acquisition_mode: String,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +613,8 @@ struct ServiceRuntime {
     desired_running: bool,
     started_at: Option<u64>,
     restart_count: u32,
+    consecutive_start_failures: u32,
+    startup_faulted: bool,
     last_launch_attempt: Option<Instant>,
     observed_running: bool,
     last_reason: Option<String>,
@@ -175,6 +629,17 @@ struct ProbeResult {
     reason: Option<String>,
 }
 
+fn restart_backoff(consecutive_failures: u32) -> Duration {
+    let multiplier = 1_u32 << consecutive_failures.min(4);
+    RESTART_BACKOFF.saturating_mul(multiplier)
+}
+
+fn record_start_failure(runtime: &mut ServiceRuntime) -> bool {
+    runtime.consecutive_start_failures = runtime.consecutive_start_failures.saturating_add(1);
+    runtime.startup_faulted = runtime.consecutive_start_failures >= MAX_CONSECUTIVE_START_FAILURES;
+    runtime.startup_faulted
+}
+
 pub(crate) struct ServiceSupervisor {
     workspace_root: PathBuf,
     registry_path: PathBuf,
@@ -186,6 +651,8 @@ pub(crate) struct ServiceSupervisor {
     events: VecDeque<ServiceLifecycleEvent>,
     next_event_id: u64,
     load_error: Option<String>,
+    acquisition_mode: String,
+    mode_transition_hold: bool,
 }
 
 impl ServiceSupervisor {
@@ -207,6 +674,8 @@ impl ServiceSupervisor {
                     events: VecDeque::new(),
                     next_event_id: 1,
                     load_error: Some(error),
+                    acquisition_mode: "online".to_string(),
+                    mode_transition_hold: false,
                 }
             }
         }
@@ -231,6 +700,19 @@ impl ServiceSupervisor {
         let log_root = state_root.join("logs");
         fs::create_dir_all(&log_root).map_err(|error| format!("监控日志目录创建失败：{error}"))?;
         let persisted_modes = read_modes(&state_root.join("service-startup-modes.json"));
+        let applied_mode =
+            read_applied_acquisition_mode(&state_root.join("applied-acquisition-mode.json"));
+        let (configured_mode, mode_load_error) = match configured_acquisition_mode(&workspace_root)
+        {
+            Ok(mode) => (mode, None),
+            Err(error) => (
+                applied_mode
+                    .clone()
+                    .unwrap_or_else(|| "invalid".to_string()),
+                Some(error),
+            ),
+        };
+        let acquisition_mode = applied_mode.unwrap_or_else(|| "unknown".to_string());
         let mut modes = HashMap::new();
         let mut runtimes = HashMap::new();
         for service in &registry.services {
@@ -251,13 +733,16 @@ impl ServiceSupervisor {
             runtimes.insert(
                 service.id.clone(),
                 ServiceRuntime {
-                    desired_running: mode == StartupMode::Normal,
+                    desired_running: mode == StartupMode::Normal
+                        && service_enabled_for_mode(service, &configured_mode),
                     ..ServiceRuntime::default()
                 },
             );
         }
         let events = read_events(&log_root.join("service-lifecycle.jsonl"));
         let next_event_id = events.back().map(|event| event.id + 1).unwrap_or(1);
+        let mode_transition_hold =
+            mode_load_error.is_some() || runtime_mode_transition_hold(&workspace_root);
         Ok(Self {
             workspace_root,
             registry_path,
@@ -268,11 +753,32 @@ impl ServiceSupervisor {
             modes,
             events,
             next_event_id,
-            load_error: None,
+            load_error: mode_load_error,
+            acquisition_mode,
+            mode_transition_hold,
         })
     }
 
     pub(crate) fn reconcile(&mut self) {
+        self.mode_transition_hold = runtime_mode_transition_hold(&self.workspace_root);
+        match configured_acquisition_mode(&self.workspace_root) {
+            Ok(configured_mode) => {
+                if self
+                    .load_error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("运行模式"))
+                {
+                    self.load_error = None;
+                }
+                if configured_mode != self.acquisition_mode {
+                    self.apply_acquisition_mode(configured_mode);
+                }
+            }
+            Err(error) => {
+                self.mode_transition_hold = true;
+                self.load_error = Some(error);
+            }
+        }
         let service_ids = self
             .registrations
             .iter()
@@ -280,6 +786,71 @@ impl ServiceSupervisor {
             .collect::<Vec<_>>();
         for service_id in service_ids {
             self.reconcile_service(&service_id);
+        }
+    }
+
+    fn apply_acquisition_mode(&mut self, acquisition_mode: String) {
+        let mut service_ids = self
+            .registrations
+            .iter()
+            .filter(|service| service.process.is_some())
+            .map(|service| service.id.clone())
+            .collect::<Vec<_>>();
+        // Stop data-plane services first and the business API last.  The API
+        // save request has already returned before the supervisor observes the
+        // profile change, while capture receives a chance to drain through its
+        // own mode-switch fence.
+        service_ids.sort_by_key(|id| if id == "inspection" { 1 } else { 0 });
+        let mut stop_errors = Vec::new();
+        for service_id in service_ids {
+            let observed = self.runtimes.get(&service_id).is_some_and(|runtime| {
+                runtime.child.is_some() || runtime.known_pid.is_some() || runtime.observed_running
+            }) || self
+                .registration(&service_id)
+                .is_ok_and(|registration| probe_registration(registration).ok);
+            if observed {
+                if let Err(error) = self.stop_service(&service_id, "acquisition-mode-change", false)
+                {
+                    stop_errors.push(format!("{service_id}: {error}"));
+                }
+            }
+        }
+        if !stop_errors.is_empty() {
+            self.load_error = Some(format!(
+                "运行模式切换停止服务失败，保持模式 {}：{}",
+                self.acquisition_mode,
+                stop_errors.join("; ")
+            ));
+            return;
+        }
+        let path = self.state_root.join("applied-acquisition-mode.json");
+        let persisted = fs::create_dir_all(&self.state_root).and_then(|_| {
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&json!({
+                    "schema": "steel.applied-acquisition-mode.v1",
+                    "acquisitionMode": acquisition_mode,
+                    "updatedAt": unix_time_millis().to_string()
+                }))
+                .unwrap_or_default(),
+            )
+        });
+        if let Err(error) = persisted {
+            self.load_error = Some(format!(
+                "运行模式切换状态持久化失败，保持模式 {}：{error}",
+                self.acquisition_mode
+            ));
+            return;
+        }
+        if let Err(error) = promote_released_runtime_mode(&self.workspace_root, &acquisition_mode) {
+            self.load_error = Some(format!(
+                "目标模式已持久化，但提交日志晋级失败，将保持目标模式故障状态：{error}"
+            ));
+        }
+        self.acquisition_mode = acquisition_mode;
+        for runtime in self.runtimes.values_mut() {
+            runtime.consecutive_start_failures = 0;
+            runtime.startup_faulted = false;
         }
     }
 
@@ -298,6 +869,21 @@ impl ServiceSupervisor {
             .copied()
             .unwrap_or(StartupMode::Manual);
 
+        if !service_enabled_for_mode(&registration, &self.acquisition_mode) {
+            let observed = self.runtimes.get(service_id).is_some_and(|runtime| {
+                runtime.child.is_some() || runtime.known_pid.is_some() || runtime.observed_running
+            }) || probe_registration(&registration).ok;
+            if observed {
+                let _ = self.stop_service(service_id, "acquisition-mode", false);
+            } else if let Some(runtime) = self.runtimes.get_mut(service_id) {
+                runtime.desired_running = false;
+                runtime.observed_running = false;
+                runtime.last_reason = None;
+                runtime.last_probe = None;
+            }
+            return;
+        }
+
         let mut exited = None;
         if let Some(runtime) = self.runtimes.get_mut(service_id) {
             if let Some(child) = runtime.child.as_mut() {
@@ -314,6 +900,14 @@ impl ServiceSupervisor {
             }
         }
         if let Some((pid, code)) = exited {
+            if let Some(runtime) = self.runtimes.get_mut(service_id) {
+                if record_start_failure(runtime) {
+                    runtime.last_reason = Some(format!(
+                        "目标模式服务连续启动失败 {} 次，已停止自动重试；请修复配置后显式启动",
+                        runtime.consecutive_start_failures
+                    ));
+                }
+            }
             self.append_event(
                 &registration,
                 "exit",
@@ -334,6 +928,8 @@ impl ServiceSupervisor {
             if probe.ok {
                 runtime.observed_running = true;
                 runtime.desired_running = mode == StartupMode::Normal || runtime.desired_running;
+                runtime.consecutive_start_failures = 0;
+                runtime.startup_faulted = false;
                 runtime.last_reason = None;
                 if runtime.known_pid.is_none() {
                     runtime.known_pid = listener_pid(resolved_port(&registration));
@@ -356,16 +952,23 @@ impl ServiceSupervisor {
                     if mode == StartupMode::Manual {
                         runtime.desired_running = false;
                     }
-                    should_start = mode == StartupMode::Normal
-                        && runtime
-                            .last_launch_attempt
-                            .is_none_or(|attempt| attempt.elapsed() >= RESTART_BACKOFF);
+                    should_start = !self.mode_transition_hold
+                        && !runtime.startup_faulted
+                        && mode == StartupMode::Normal
+                        && runtime.last_launch_attempt.is_none_or(|attempt| {
+                            attempt.elapsed() >= restart_backoff(runtime.consecutive_start_failures)
+                        });
                 }
-                runtime.last_reason = probe.reason.clone();
+                if !runtime.startup_faulted {
+                    runtime.last_reason = probe.reason.clone();
+                }
             }
             runtime.last_probe = Some(probe);
         }
         if unexpected_exit {
+            if let Some(runtime) = self.runtimes.get_mut(service_id) {
+                record_start_failure(runtime);
+            }
             self.append_event(
                 &registration,
                 "exit",
@@ -392,9 +995,13 @@ impl ServiceSupervisor {
         source: &str,
     ) -> Result<String, String> {
         match action.trim().to_ascii_lowercase().as_str() {
-            "start" => self.start_service(service_id, source),
+            "start" => {
+                self.clear_startup_fault(service_id);
+                self.start_service(service_id, source)
+            }
             "stop" => self.stop_service(service_id, source, true),
             "restart" => {
+                self.clear_startup_fault(service_id);
                 let mode = self.mode(service_id)?;
                 if mode == StartupMode::Disabled {
                     return Err("服务已禁用，请先修改启动模式".to_string());
@@ -404,6 +1011,14 @@ impl ServiceSupervisor {
                 self.start_service(service_id, source)
             }
             _ => Err("服务操作仅支持 start、stop 或 restart".to_string()),
+        }
+    }
+
+    fn clear_startup_fault(&mut self, service_id: &str) {
+        if let Some(runtime) = self.runtimes.get_mut(service_id) {
+            runtime.consecutive_start_failures = 0;
+            runtime.startup_faulted = false;
+            runtime.last_launch_attempt = None;
         }
     }
 
@@ -417,6 +1032,11 @@ impl ServiceSupervisor {
         let mode = StartupMode::parse(mode)?;
         self.modes.insert(service_id.to_string(), mode);
         if let Some(runtime) = self.runtimes.get_mut(service_id) {
+            if mode == StartupMode::Normal {
+                runtime.consecutive_start_failures = 0;
+                runtime.startup_faulted = false;
+                runtime.last_launch_attempt = None;
+            }
             runtime.desired_running = mode == StartupMode::Normal
                 || (mode == StartupMode::Manual && runtime.observed_running);
         }
@@ -434,7 +1054,9 @@ impl ServiceSupervisor {
         );
         if mode == StartupMode::Disabled {
             let _ = self.stop_service(service_id, source, false);
-        } else if mode == StartupMode::Normal {
+        } else if mode == StartupMode::Normal
+            && service_enabled_for_mode(&registration, &self.acquisition_mode)
+        {
             let probe = probe_registration(&registration);
             if !probe.ok && listener_pid(resolved_port(&registration)).is_none() {
                 let _ = self.start_service(service_id, source);
@@ -448,7 +1070,16 @@ impl ServiceSupervisor {
     }
 
     fn start_service(&mut self, service_id: &str, source: &str) -> Result<String, String> {
+        if self.mode_transition_hold {
+            return Err("运行模式切换正在提交，暂不允许启动服务".to_string());
+        }
         let registration = self.registration(service_id)?.clone();
+        if !service_enabled_for_mode(&registration, &self.acquisition_mode) {
+            return Err(format!(
+                "{} 在 {} 采集模式下已停用",
+                registration.name, self.acquisition_mode
+            ));
+        }
         let mode = self.mode(service_id)?;
         if mode == StartupMode::Disabled {
             return Err("服务已禁用，请先修改启动模式".to_string());
@@ -524,6 +1155,10 @@ impl ServiceSupervisor {
                 ),
             );
         }
+        // The supervisor's persisted mode is the process-level authority.  A
+        // child must reject startup if its selected profile disagrees, which
+        // prevents a fenced/ready transition from creating split-brain state.
+        command.env("STEEL_ACQUISITION_MODE", &self.acquisition_mode);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -559,7 +1194,15 @@ impl ServiceSupervisor {
             Err(error) => {
                 if let Some(runtime) = self.runtimes.get_mut(service_id) {
                     runtime.last_launch_attempt = Some(Instant::now());
-                    runtime.last_reason = Some(error.clone());
+                    record_start_failure(runtime);
+                    runtime.last_reason = Some(if runtime.startup_faulted {
+                        format!(
+                            "{error}；连续失败 {} 次，已停止自动重试",
+                            runtime.consecutive_start_failures
+                        )
+                    } else {
+                        error.clone()
+                    });
                 }
                 self.append_event(
                     &registration,
@@ -650,6 +1293,7 @@ impl ServiceSupervisor {
                 "path": self.registry_path,
                 "owner": "tauri-service-supervisor",
                 "loadError": self.load_error,
+                "acquisitionMode": self.acquisition_mode,
                 "services": self.registrations.iter().map(|service| json!({
                     "id": service.id,
                     "name": service.name,
@@ -668,14 +1312,29 @@ impl ServiceSupervisor {
             .copied()
             .unwrap_or(StartupMode::Manual);
         let runtime = self.runtimes.get(&registration.id);
-        let probe = runtime
-            .and_then(|runtime| runtime.last_probe.clone())
-            .unwrap_or_else(|| probe_registration(registration));
+        let enabled_for_mode = service_enabled_for_mode(registration, &self.acquisition_mode);
+        let probe = if enabled_for_mode {
+            runtime
+                .and_then(|runtime| runtime.last_probe.clone())
+                .unwrap_or_else(|| probe_registration(registration))
+        } else {
+            ProbeResult {
+                ok: true,
+                status: 0,
+                latency_ms: 0,
+                reason: None,
+            }
+        };
         let pid = runtime.and_then(|runtime| runtime.known_pid);
         let started_at = runtime.and_then(|runtime| runtime.started_at);
         let process_alive = pid.is_some();
-        let status = if mode == StartupMode::Disabled {
+        let startup_faulted = runtime.is_some_and(|runtime| runtime.startup_faulted);
+        let status = if !enabled_for_mode {
+            "disabled-for-mode"
+        } else if mode == StartupMode::Disabled {
             "disabled"
+        } else if startup_faulted && !process_alive {
+            "startup-failed"
         } else if probe.ok {
             "running"
         } else if process_alive && probe.status > 0 {
@@ -685,14 +1344,19 @@ impl ServiceSupervisor {
         } else {
             "stopped"
         };
-        let reason = probe.reason.clone().or_else(|| {
-            runtime
-                .and_then(|runtime| runtime.last_reason.clone())
-                .filter(|value| !value.is_empty())
-        });
+        let reason = runtime
+            .filter(|runtime| runtime.startup_faulted)
+            .and_then(|runtime| runtime.last_reason.clone())
+            .filter(|value| !value.is_empty())
+            .or_else(|| probe.reason.clone())
+            .or_else(|| {
+                runtime
+                    .and_then(|runtime| runtime.last_reason.clone())
+                    .filter(|value| !value.is_empty())
+            });
         let managed = registration.process.is_some();
-        let can_start = managed && mode != StartupMode::Disabled && !probe.ok;
-        let can_stop = managed && (process_alive || probe.ok);
+        let can_start = managed && enabled_for_mode && mode != StartupMode::Disabled && !probe.ok;
+        let can_stop = managed && enabled_for_mode && (process_alive || probe.ok);
         SupervisorServiceSnapshot {
             id: registration.id.clone(),
             name: registration.name.clone(),
@@ -702,7 +1366,7 @@ impl ServiceSupervisor {
             port: resolved_port(registration),
             health_path: registration.health_path.clone(),
             ok: probe.ok,
-            required: registration.required,
+            required: service_required_for_mode(registration, &self.acquisition_mode),
             status: status.to_string(),
             response_status: probe.status,
             latency_ms: probe.latency_ms,
@@ -716,13 +1380,17 @@ impl ServiceSupervisor {
                 "pid": pid,
                 "startedAt": started_at.map(|value| value.to_string()),
                 "restartCount": runtime.map_or(0, |runtime| runtime.restart_count),
-                "autoRestart": mode == StartupMode::Normal
+                "consecutiveStartFailures": runtime.map_or(0, |runtime| runtime.consecutive_start_failures),
+                "startupFaulted": startup_faulted,
+                "autoRestart": enabled_for_mode && mode == StartupMode::Normal && !startup_faulted,
+                "acquisitionMode": self.acquisition_mode,
+                "enabledForMode": enabled_for_mode
             }),
             operations: vec![
                 json!({"id":"refresh-status","label":"刷新状态","effect":"query","scope":"service","enabled":true}),
                 json!({"id":"start","label":"启动","effect":"mutation","scope":"service","enabled":can_start}),
                 json!({"id":"stop","label":"停止","effect":"mutation","scope":"service","enabled":can_stop}),
-                json!({"id":"restart","label":"重启","effect":"mutation","scope":"service","enabled":managed && mode != StartupMode::Disabled && (process_alive || probe.ok)}),
+                json!({"id":"restart","label":"重启","effect":"mutation","scope":"service","enabled":managed && enabled_for_mode && mode != StartupMode::Disabled && (process_alive || probe.ok)}),
                 json!({"id":"set-startup-mode","label":"启动模式","effect":"mutation","scope":"service","enabled":managed}),
             ],
             control: json!({
@@ -731,8 +1399,10 @@ impl ServiceSupervisor {
                 "reason": if managed { Value::Null } else { json!("service_has_no_registered_process") }
             }),
             startup_mode: mode.as_str().to_string(),
-            auto_restart: mode == StartupMode::Normal,
+            auto_restart: enabled_for_mode && mode == StartupMode::Normal && !startup_faulted,
             managed,
+            enabled_for_mode,
+            acquisition_mode: self.acquisition_mode.clone(),
         }
     }
 
@@ -1164,6 +1834,7 @@ fn unix_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn startup_modes_are_bounded_and_normal_enables_auto_restart() {
@@ -1176,6 +1847,26 @@ mod tests {
     }
 
     #[test]
+    fn startup_failures_use_bounded_backoff_and_fault_after_five_attempts() {
+        assert_eq!(restart_backoff(0), Duration::from_secs(3));
+        assert_eq!(restart_backoff(1), Duration::from_secs(6));
+        assert_eq!(restart_backoff(4), Duration::from_secs(48));
+        assert_eq!(restart_backoff(40), Duration::from_secs(48));
+
+        let mut runtime = ServiceRuntime::default();
+        for attempt in 1..MAX_CONSECUTIVE_START_FAILURES {
+            assert!(!record_start_failure(&mut runtime));
+            assert_eq!(runtime.consecutive_start_failures, attempt);
+        }
+        assert!(record_start_failure(&mut runtime));
+        assert_eq!(
+            runtime.consecutive_start_failures,
+            MAX_CONSECUTIVE_START_FAILURES
+        );
+        assert!(runtime.startup_faulted);
+    }
+
+    #[test]
     fn monitor_only_accepts_loopback_service_origins() {
         assert_eq!(
             normalize_origin("http://127.0.0.1:4873/"),
@@ -1183,5 +1874,319 @@ mod tests {
         );
         assert!(normalize_origin("https://127.0.0.1:4873").is_none());
         assert!(normalize_origin("http://10.0.0.1:4873").is_none());
+    }
+
+    #[test]
+    fn acquisition_mode_conditions_disable_capture_without_disabling_history_services() {
+        let registration = ServiceRegistration {
+            id: "capture".to_string(),
+            name: "capture".to_string(),
+            role: String::new(),
+            kind: "capture".to_string(),
+            default_origin: "http://127.0.0.1:4317".to_string(),
+            origin_env: None,
+            port_env: None,
+            health_path: "/health".to_string(),
+            required: true,
+            enabled_when_modes: vec!["online".to_string(), "simulation".to_string()],
+            required_when_modes: vec!["online".to_string(), "simulation".to_string()],
+            lifecycle: String::new(),
+            process: None,
+        };
+        assert!(service_enabled_for_mode(&registration, "online"));
+        assert!(service_required_for_mode(&registration, "simulation"));
+        assert!(!service_enabled_for_mode(&registration, "offline"));
+        assert!(!service_required_for_mode(&registration, "offline"));
+    }
+
+    #[test]
+    fn acquisition_mode_is_read_from_the_active_site_runtime_profile() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-monitor-acquisition-mode-{}-{stamp}",
+            std::process::id()
+        ));
+        let site_root = root.join("config/sites/test-site");
+        fs::create_dir_all(&site_root).expect("site root");
+        fs::write(
+            root.join("config/project.json"),
+            r#"{"activeSiteConfig":"config/sites/test-site/site.json"}"#,
+        )
+        .expect("project");
+        fs::write(
+            site_root.join("site.json"),
+            r#"{"runtimeProfile":"runtime.json"}"#,
+        )
+        .expect("site");
+        fs::write(
+            site_root.join("runtime.json"),
+            r#"{"acquisitionMode":"simulation","provider":"external-api"}"#,
+        )
+        .expect("runtime");
+
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("configured mode"),
+            "simulation"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_mode_record_fences_an_uncommitted_profile_publish() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-monitor-mode-commit-{}-{stamp}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        fs::create_dir_all(&config_root).expect("config root");
+        fs::write(
+            config_root.join("project.json"),
+            r#"{"activeRuntimeProfile":"config/runtime.json"}"#,
+        )
+        .expect("project");
+        fs::write(
+            config_root.join("runtime.json"),
+            r#"{"acquisitionMode":"simulation","provider":"external-api"}"#,
+        )
+        .expect("new profile bytes");
+        fs::write(
+            root.join(RUNTIME_MODE_COMMIT_PATH),
+            serde_json::to_vec(&json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": "fence",
+                "acquisitionMode": "online",
+                "configHash": "old-generation",
+                "profileSha256": "0".repeat(64)
+            }))
+            .expect("commit json"),
+        )
+        .expect("commit record");
+
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("fenced mode"),
+            "online"
+        );
+
+        let runtime_bytes = fs::read(config_root.join("runtime.json")).expect("runtime bytes");
+        let runtime_sha256 = format!("{:x}", Sha256::digest(&runtime_bytes));
+
+        fs::write(
+            root.join(RUNTIME_MODE_COMMIT_PATH),
+            serde_json::to_vec(&json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": "ready",
+                "acquisitionMode": "simulation",
+                "previousAcquisitionMode": "online",
+                "releaseAfterMillis": unix_time_millis() + 60_000,
+                "profileSha256": runtime_sha256
+            }))
+            .expect("ready json"),
+        )
+        .expect("ready record");
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("ready mode before release"),
+            "online"
+        );
+
+        let runtime_bytes = fs::read(config_root.join("runtime.json")).expect("runtime bytes");
+        let runtime_sha256 = format!("{:x}", Sha256::digest(&runtime_bytes));
+        fs::write(
+            root.join(RUNTIME_MODE_COMMIT_PATH),
+            serde_json::to_vec(&json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": "ready",
+                "acquisitionMode": "simulation",
+                "previousAcquisitionMode": "online",
+                "releaseAfterMillis": 0,
+                "profileSha256": runtime_sha256
+            }))
+            .expect("released ready json"),
+        )
+        .expect("released ready record");
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("ready mode after release"),
+            "simulation"
+        );
+
+        fs::write(
+            root.join(RUNTIME_MODE_COMMIT_PATH),
+            serde_json::to_vec(&json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": "committed",
+                "acquisitionMode": "simulation",
+                "configHash": "new-generation",
+                "profileSha256": runtime_sha256
+            }))
+            .expect("commit json"),
+        )
+        .expect("advance commit record");
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("committed mode"),
+            "simulation"
+        );
+
+        fs::write(
+            config_root.join("runtime.json"),
+            r#"{"acquisitionMode":"simulation","provider":"external-api","displayName":"same-mode edit"}"#,
+        )
+        .expect("same-mode edit");
+        assert!(configured_acquisition_mode(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_journal_recovers_staged_profile_and_holds_until_release() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-monitor-mode-publish-{}-{stamp}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        let staging_root = config_root.join("runtime-mode-staging");
+        fs::create_dir_all(&staging_root).expect("staging root");
+        fs::write(
+            config_root.join("project.json"),
+            r#"{"activeRuntimeProfile":"config/runtime.json"}"#,
+        )
+        .expect("project");
+        fs::write(
+            config_root.join("runtime.json"),
+            r#"{"acquisitionMode":"online","provider":"external-api"}"#,
+        )
+        .expect("old runtime");
+        let target = br#"{"acquisitionMode":"simulation","provider":"external-api"}"#;
+        fs::write(staging_root.join("transition.json"), target).expect("staged runtime");
+        let target_hash = format!("{:x}", Sha256::digest(target));
+        fs::write(
+            root.join(RUNTIME_MODE_COMMIT_PATH),
+            serde_json::to_vec(&json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": "publish",
+                "acquisitionMode": "simulation",
+                "previousAcquisitionMode": "online",
+                "profileSha256": target_hash,
+                "stagedProfile": "config/runtime-mode-staging/transition.json"
+            }))
+            .expect("publish journal"),
+        )
+        .expect("publish marker");
+
+        assert!(runtime_mode_transition_hold(&root));
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("recover publish journal"),
+            "online"
+        );
+        assert_eq!(
+            fs::read(config_root.join("runtime.json")).expect("published runtime"),
+            target
+        );
+        let marker_path = root.join(RUNTIME_MODE_COMMIT_PATH);
+        let mut marker: Value =
+            serde_json::from_slice(&fs::read(&marker_path).expect("ready marker"))
+                .expect("ready marker JSON");
+        assert_eq!(marker["state"], json!("ready"));
+        assert!(runtime_mode_transition_hold(&root));
+
+        marker["releaseAfterMillis"] = json!(0);
+        fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("released marker JSON"),
+        )
+        .expect("released marker");
+        assert!(!runtime_mode_transition_hold(&root));
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("released mode"),
+            "simulation"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transition_hold_is_fail_closed_for_incomplete_or_invalid_markers() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-monitor-mode-hold-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("config")).expect("config root");
+        let marker = root.join(RUNTIME_MODE_COMMIT_PATH);
+        fs::write(&marker, b"not-json").expect("invalid marker");
+        assert!(runtime_mode_transition_hold(&root));
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": "committed"
+            }))
+            .expect("committed marker"),
+        )
+        .expect("committed marker");
+        assert!(runtime_mode_transition_hold(&root));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_fence_with_unchanged_profile_recovers_the_previous_mode() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "steel-monitor-stale-fence-{}-{stamp}",
+            std::process::id()
+        ));
+        let config_root = root.join("config");
+        fs::create_dir_all(&config_root).expect("config root");
+        fs::write(
+            config_root.join("project.json"),
+            r#"{"activeRuntimeProfile":"config/runtime.json"}"#,
+        )
+        .expect("project");
+        let runtime = br#"{"acquisitionMode":"online","provider":"external-api"}"#;
+        fs::write(config_root.join("runtime.json"), runtime).expect("runtime profile");
+        let profile_sha256 = format!("{:x}", Sha256::digest(runtime));
+        let marker_path = root.join(RUNTIME_MODE_COMMIT_PATH);
+        fs::write(
+            &marker_path,
+            serde_json::to_vec(&json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": "fence",
+                "acquisitionMode": "online",
+                "previousAcquisitionMode": "online",
+                "targetAcquisitionMode": "simulation",
+                "updatedAt": 0,
+                "profileSha256": profile_sha256
+            }))
+            .expect("fence marker"),
+        )
+        .expect("fence record");
+
+        assert_eq!(
+            configured_acquisition_mode(&root).expect("recover stale fence"),
+            "online"
+        );
+        let recovered: Value =
+            serde_json::from_slice(&fs::read(&marker_path).expect("recovered marker"))
+                .expect("recovered marker JSON");
+        assert_eq!(recovered["state"], json!("committed"));
+        assert_eq!(
+            recovered["recoveryReason"],
+            json!("stale-fence-profile-unchanged")
+        );
+        assert!(!runtime_mode_transition_hold(&root));
+        let _ = fs::remove_dir_all(root);
     }
 }

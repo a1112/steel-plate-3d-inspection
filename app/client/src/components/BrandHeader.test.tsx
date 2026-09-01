@@ -16,6 +16,7 @@ const status: DeviceStatus = {
 
 const directDashboardMode: RuntimeDashboardMode = {
   kind: 'direct',
+  acquisitionMode: 'online',
   cameraCount: 8,
   requestsOnlineServices: true,
   requestsStandardRecords: false,
@@ -23,10 +24,17 @@ const directDashboardMode: RuntimeDashboardMode = {
   showsCaptureManagement: true,
   showsReconstruction: true,
   supportsOfflineReplay: false,
+  acquisitionDisabled: false,
+  allowsAcquisitionWrites: true,
+  readOnly: false,
+  usesPhysicalHardware: true,
+  usesSimulationSource: false,
+  allowsProductionWrites: true,
 };
 
 const bkvDashboardMode: RuntimeDashboardMode = {
   kind: 'bkv',
+  acquisitionMode: 'offline',
   cameraCount: 6,
   requestsOnlineServices: false,
   requestsStandardRecords: true,
@@ -34,6 +42,12 @@ const bkvDashboardMode: RuntimeDashboardMode = {
   showsCaptureManagement: false,
   showsReconstruction: false,
   supportsOfflineReplay: true,
+  acquisitionDisabled: true,
+  allowsAcquisitionWrites: false,
+  readOnly: true,
+  usesPhysicalHardware: false,
+  usesSimulationSource: false,
+  allowsProductionWrites: false,
 };
 
 function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {}) {
@@ -51,6 +65,24 @@ function renderHeader(overrides: Partial<ComponentProps<typeof BrandHeader>> = {
 }
 
 describe('BrandHeader', () => {
+  it('shows formal simulation mode without physical hardware status', () => {
+    const { container } = renderHeader({
+      dashboardMode: {
+        ...directDashboardMode,
+        acquisitionMode: 'simulation',
+        showsHardwareStatus: false,
+        usesPhysicalHardware: false,
+        usesSimulationSource: true,
+      },
+    });
+
+    expect(screen.getByText('模拟运行')).toBeInTheDocument();
+    expect(screen.getByText('模拟（数据回放）')).toBeInTheDocument();
+    expect(screen.getByText('模拟通道')).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="hardware-status-stack"]')).toBeNull();
+    expect(screen.queryByText('相机状态')).not.toBeInTheDocument();
+  });
+
   it('shows BKV data status without online hardware or service alarms', () => {
     const { container } = renderHeader({
       dashboardMode: bkvDashboardMode,
@@ -63,7 +95,7 @@ describe('BrandHeader', () => {
     });
 
     expect(screen.getByText('BKV 模式')).toBeInTheDocument();
-    expect(screen.getByText('离线回放')).toBeInTheDocument();
+    expect(screen.getByText('离线')).toBeInTheDocument();
     expect(screen.getByText('离线数据')).toBeInTheDocument();
     expect(screen.getByText('6/6')).toBeInTheDocument();
     expect(screen.getByText('legacy-1893700-1893710')).toBeInTheDocument();

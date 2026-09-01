@@ -27,6 +27,7 @@ import {
   persistCaptureParamsToDevice,
   readCaptureProfile,
   readCaptureProfiles,
+  readCaptureSimulationStatus,
   readCaptureSnapshot,
   readCaptureCalibrationOperationDetail,
   readCaptureContinuousSettings,
@@ -50,6 +51,10 @@ import {
   saveAllCaptureCameraParams,
   setCaptureParam,
   setCaptureSoftwareTrigger,
+  pauseCaptureSimulation,
+  resetCaptureSimulation,
+  resumeCaptureSimulation,
+  startCaptureSimulation,
   startCaptureStream,
   stopCaptureStream,
   validateCaptureContinuousSettings,
@@ -239,6 +244,159 @@ describe("readCaptureSnapshot", () => {
       supportedModels: ["Ranger3-60"],
     });
     expect(result.driver.name).not.toContain("LVM");
+  });
+
+  it("accepts nullable SDK health in simulation mode and preserves channel counts", async () => {
+    const channel = {
+      cameraIndex: 1,
+      cameraId: "C1",
+      name: "C1",
+      role: "replay-1",
+      ip: "simulation://C1",
+      model: "LG3D replay channel",
+      sn: "SIM-C1",
+      driverId: "lg3d-replay",
+      connected: false,
+      replayChannelReady: true,
+      simulationChannel: true,
+      acquisitionState: "replay-running",
+      deviceId: 1,
+      configId: "C1",
+    };
+    const simulation = {
+      code: 0,
+      runtimeMode: "simulation",
+      state: "running",
+      sourceRoot: "H:/captured-data",
+      sourceAvailable: true,
+      sourceDatasetId: "lg3d-0123456789abcdef01234567",
+      sourceContentHash: "a".repeat(64),
+      sourceRunId: "run-001",
+      speed: 1,
+      loop: false,
+      sessionGapMs: 1500,
+      sessionCount: 1,
+      usableSessionCount: 1,
+      candidateSessionCount: 2,
+      rejectedSessionCount: 1,
+      rejectedTrackCount: 1,
+      currentSessionIndex: 1,
+      currentSessionId: "SESSION-001",
+      currentCoilId: "COIL-001",
+      positionMs: 500,
+      durationMs: 1000,
+      progress: 0.5,
+      channels: [{ cameraId: 1, cameraKey: "C1", sourceFlow: "depth", frameIndex: 1, frameCount: 2 }],
+      lastError: null,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.endsWith("/api/config")
+        ? { capture: { mode: "simulation", driver: "lg3d-replay", cameras: [] } }
+        : url.endsWith("/api/capture/health")
+          ? {
+              service: "steel_sick_capture_sidecar",
+              time: "2026-08-31T12:00:00Z",
+              provider: "external-api",
+              runtimeMode: "simulation",
+              historyOnly: false,
+              sdkRequired: false,
+              sdkReady: null,
+              sdkCode: null,
+              connected: false,
+              ip: "",
+              driverId: "lg3d-replay",
+              driverName: "LG_3D deterministic replay",
+              cameraCount: 0,
+              expectedCameras: 6,
+              physicalCameraCount: 0,
+              physicalCamerasOnline: 0,
+              simulationChannelCount: 2,
+              replayChannels: 2,
+              simulation,
+            }
+          : url.endsWith("/api/cameras")
+            ? { cameras: [channel] }
+            : url.endsWith("/api/camera/statuses")
+              ? { statuses: [channel] }
+              : url.endsWith("/api/camera/status")
+                ? channel
+                : { events: [] };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await readCaptureSnapshot();
+
+    expect(result.health).toMatchObject({
+      runtimeMode: "simulation",
+      sdkRequired: false,
+      sdkReady: null,
+      sdkCode: null,
+      connected: false,
+      ip: "",
+      cameraCount: 0,
+      physicalCameraCount: 0,
+      simulationChannelCount: 2,
+      simulation: { sourceDatasetId: "lg3d-0123456789abcdef01234567" },
+    });
+    expect(result.statuses[0]).toMatchObject({
+      configId: "C1",
+      sdkStatus: "simulation",
+      connected: false,
+      replayChannelReady: true,
+      acquisitionState: "replay-running",
+    });
+  });
+});
+
+describe("capture simulation API", () => {
+  it("uses the Rust proxy status and unified control routes", async () => {
+    const payload = {
+      code: 0,
+      runtimeMode: "simulation",
+      state: "idle",
+      sourceRoot: "H:/captured-data",
+      sourceAvailable: true,
+      speed: 1,
+      loop: false,
+      sessionGapMs: 1500,
+      sessionCount: 2,
+      currentSessionIndex: 0,
+      currentSessionId: "",
+      currentCoilId: "",
+      positionMs: 0,
+      durationMs: 12000,
+      progress: 0,
+      channels: [],
+      lastError: null,
+    };
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await readCaptureSimulationStatus();
+    await startCaptureSimulation({ speed: 2, loop: true, sessionGapMs: 1750 });
+    await pauseCaptureSimulation();
+    await resumeCaptureSimulation();
+    await resetCaptureSimulation();
+
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:4873/api/capture/simulation/status");
+    const controlCalls = fetchMock.mock.calls.slice(1);
+    expect(controlCalls.every(([url, init]) => (
+      url === "http://127.0.0.1:4873/api/capture/simulation/control" && init?.method === "POST"
+    ))).toBe(true);
+    expect(controlCalls.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+      { action: "start", speed: 2, loop: true, sessionGapMs: 1750 },
+      { action: "pause" },
+      { action: "resume" },
+      { action: "reset" },
+    ]);
   });
 });
 

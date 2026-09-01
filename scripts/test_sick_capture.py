@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -77,9 +78,17 @@ from scripts.sick_capture.provider import (
     SickCaptureHTTPServer,
     _image_quality_metrics,
     _steel_tail_metrics,
+    serve,
 )
 from scripts.sick_capture.image_pipeline import build_flow_image_artifacts
-from scripts.sick_capture.replay import LG3DReplaySource, validate_lg3d_dataset
+from scripts.sick_capture.replay import (
+    LG3DReplayBackend,
+    LG3DReplaySource,
+    ReplayCatalog,
+    ReplayCompleted,
+    ReplayCoordinator,
+    validate_lg3d_dataset,
+)
 from scripts.sick_capture.storage import DualFormatWriter, atomic_summary
 from scripts.sick_capture.paths import (
     acquisition_manifest_path,
@@ -144,7 +153,184 @@ class SickCaptureCliTests(unittest.TestCase):
             "127.0.0.1",
             4317,
             history_only=True,
+            runtime_profile=None,
+            runtime_mode=None,
+            simulation_source=None,
+            simulation_speed=None,
+            simulation_loop=None,
+            simulation_session_gap_ms=None,
         )
+
+    def test_service_simulation_cli_overrides_are_forwarded(self) -> None:
+        with patch.object(sick_capture_cli, "serve") as serve:
+            result = sick_capture_cli.service_main(
+                [
+                    "--profile",
+                    "capture.json",
+                    "--runtime-profile",
+                    "runtime.json",
+                    "--mode",
+                    "simulation",
+                    "--simulation-source",
+                    "I:/sample",
+                    "--simulation-speed",
+                    "2.5",
+                    "--simulation-loop",
+                    "--simulation-session-gap-ms",
+                    "1750",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        serve.assert_called_once_with(
+            Path("capture.json"),
+            "127.0.0.1",
+            4317,
+            history_only=False,
+            runtime_profile=Path("runtime.json"),
+            runtime_mode="simulation",
+            simulation_source=Path("I:/sample"),
+            simulation_speed=2.5,
+            simulation_loop=True,
+            simulation_session_gap_ms=1750,
+        )
+
+    def test_runtime_profile_supplies_simulation_mode_and_preferred_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = write_six_camera_profile(root)
+            (root / "SICKGigEVisionTL.cti").unlink()
+            runtime_path = root / "runtime.json"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "steel.runtime-profile.v1",
+                        "acquisitionMode": "simulation",
+                        "simulation": {
+                            "sourceRoot": "usb-copy",
+                            "speed": 1.5,
+                            "loop": True,
+                            "interSessionGapMs": 1800,
+                            "gapMs": 1900,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_runtime = Mock()
+            fake_server = Mock()
+            with patch(
+                "scripts.sick_capture.provider.ProviderRuntime",
+                return_value=fake_runtime,
+            ) as runtime_type, patch(
+                "scripts.sick_capture.provider.SickCaptureHTTPServer",
+                return_value=fake_server,
+            ):
+                serve(profile_path, runtime_profile=runtime_path)
+
+            _, kwargs = runtime_type.call_args
+            self.assertEqual(kwargs["runtime_mode"], "simulation")
+            self.assertEqual(kwargs["simulation_source"], (root / "usb-copy").resolve())
+            self.assertEqual(kwargs["simulation_speed"], 1.5)
+            self.assertTrue(kwargs["simulation_loop"])
+            self.assertEqual(kwargs["simulation_session_gap_ms"], 1800)
+            fake_server.serve_forever.assert_called_once_with(poll_interval=0.25)
+            fake_server.server_close.assert_called_once_with()
+
+    def test_formal_simulation_service_requires_six_replay_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = write_profile(root)
+            runtime_path = root / "runtime.json"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "steel.runtime-profile.v1",
+                        "acquisitionMode": "simulation",
+                        "simulation": {"sourceRoot": "usb-copy"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "scripts.sick_capture.provider.ProviderRuntime"
+            ) as runtime_type:
+                with self.assertRaisesRegex(ValueError, "exactly six"):
+                    serve(profile_path, runtime_profile=runtime_path)
+                runtime_type.assert_not_called()
+
+    def test_supervisor_expected_mode_must_match_resolved_runtime_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = write_profile(root)
+            runtime_path = root / "runtime.json"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "steel.runtime-profile.v1",
+                        "acquisitionMode": "simulation",
+                        "simulation": {"sourceRoot": "usb-copy"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"STEEL_ACQUISITION_MODE": "online"},
+                clear=False,
+            ), patch(
+                "scripts.sick_capture.provider.ProviderRuntime"
+            ) as runtime_type:
+                with self.assertRaisesRegex(ValueError, "split-brain"):
+                    serve(profile_path, runtime_profile=runtime_path)
+                runtime_type.assert_not_called()
+
+            with patch.dict(
+                os.environ,
+                {"STEEL_ACQUISITION_MODE": "unexpected"},
+                clear=False,
+            ), patch(
+                "scripts.sick_capture.provider.ProviderRuntime"
+            ) as runtime_type:
+                with self.assertRaisesRegex(ValueError, "must be online"):
+                    serve(profile_path, runtime_profile=runtime_path)
+                runtime_type.assert_not_called()
+
+    def test_legacy_history_only_overrides_runtime_profile_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile_path = write_profile(root)
+            (root / "SICKGigEVisionTL.cti").unlink()
+            runtime_path = root / "runtime.json"
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "steel.runtime-profile.v1",
+                        "acquisitionMode": "simulation",
+                        "simulation": {"sourceRoot": "missing-usb-copy"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake_runtime = Mock()
+            fake_server = Mock()
+            with patch(
+                "scripts.sick_capture.provider.ProviderRuntime",
+                return_value=fake_runtime,
+            ) as runtime_type, patch(
+                "scripts.sick_capture.provider.SickCaptureHTTPServer",
+                return_value=fake_server,
+            ):
+                serve(
+                    profile_path,
+                    runtime_profile=runtime_path,
+                    history_only=True,
+                )
+
+            _, kwargs = runtime_type.call_args
+            self.assertEqual(kwargs["runtime_mode"], "offline")
+            fake_server.serve_forever.assert_called_once_with(poll_interval=0.25)
+            fake_server.server_close.assert_called_once_with()
 
 
 def write_profile(root: Path) -> Path:
@@ -194,6 +380,99 @@ def write_profile(root: Path) -> Path:
     path = root / "capture.json"
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
     return path
+
+
+def write_six_camera_profile(root: Path) -> Path:
+    path = write_profile(root)
+    profile = json.loads(path.read_text(encoding="utf-8"))
+    first = dict(profile["cameras"][0])
+    profile["expectedCameras"] = 6
+    profile["cameras"] = [
+        {
+            **first,
+            "cameraIndex": camera,
+            "id": f"C{camera}",
+            "key": f"C{camera}",
+            "serialNumber": f"SICK-SN-{camera:03d}",
+            "ip": f"192.0.2.{9 + camera}",
+            "role": f"test-{camera}",
+            "storageRoot": str(root / "storage" / f"camera{camera}"),
+        }
+        for camera in range(1, 7)
+    ]
+    path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    return path
+
+
+def two_camera_profile(root: Path):
+    profile = load_profile(write_profile(root))
+    output_root = root / "simulation-output"
+    first = replace(
+        profile.cameras[0],
+        storage_root=output_root / "C1",
+    )
+    second = replace(
+        first,
+        camera_index=2,
+        camera_id="C2",
+        key="C2",
+        serial_number="SICK-SN-002",
+        ip="192.0.2.11",
+        storage_root=output_root / "C2",
+    )
+    return replace(
+        profile,
+        storage_root=output_root,
+        expected_cameras=2,
+        cameras=(first, second),
+        auto_connect=False,
+    )
+
+
+def write_simulation_fixture(source_root: Path, profile) -> None:
+    frame_rows = {
+        "C1": [
+            (5, "SESSION-A", "COIL-A", 10_000_000_000),
+            (6, "SESSION-A", "COIL-A", 10_100_000_000),
+            (7, "SESSION-B", "COIL-B", 10_200_000_000),
+        ],
+        "C2": [(5, "SESSION-A", "COIL-A", 10_020_000_000)],
+    }
+    write_simulation_rows(source_root, profile, frame_rows)
+
+
+def write_simulation_rows(
+    source_root: Path,
+    profile,
+    frame_rows: dict[str, list[tuple[int, str, str, int]]],
+) -> None:
+    for camera in profile.enabled_cameras:
+        writer = DualFormatWriter()
+        for index, session_id, coil_id, host_utc_ns in frame_rows[camera.key]:
+            frame = replace(
+                sample_frame(index),
+                camera_key=camera.key,
+                camera_id=camera.camera_id,
+                serial_number=camera.serial_number,
+                model=camera.model,
+                firmware=camera.firmware,
+                ip=camera.ip,
+                host_utc_ns=host_utc_ns,
+                host_monotonic_ns=host_utc_ns,
+            )
+            result = writer.write(
+                source_root / camera.key,
+                "10",
+                frame,
+                index=index,
+                session_id=session_id,
+            )
+            metadata = json.loads(result.lg3d_metadata.read_text(encoding="utf-8"))
+            metadata["coilId"] = coil_id
+            result.lg3d_metadata.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
 
 def write_ready_playback_roi(
@@ -2062,6 +2341,1142 @@ class SickStorageTests(unittest.TestCase):
             self.assertTrue(recovered.steel_metadata.is_file())
 
 
+class SickSimulationReplayTests(unittest.TestCase):
+    def test_writer_persists_replay_provenance_as_top_level_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            provenance = {
+                "runtimeMode": "simulation",
+                "sourceMode": "simulation",
+                "sourceDatasetId": "lg3d-0123456789abcdef01234567",
+                "sourceRunId": "run-1",
+                "sourceSessionId": "source-session-1",
+                "sourceContentHash": "a" * 64,
+                "sourceFrameContentHash": "b" * 64,
+                "replayed": True,
+                "physicalCapture": False,
+                "synthetic": False,
+            }
+            frame = replace(sample_frame(), provenance=provenance)
+            result = DualFormatWriter().write(
+                Path(directory) / "C1",
+                "1",
+                frame,
+                session_id="output-session",
+            )
+            metadata = json.loads(result.lg3d_metadata.read_text(encoding="utf-8"))
+            artifact = metadata["frameArtifact"]
+            for payload in (metadata, artifact):
+                self.assertEqual(payload["sourceMode"], "simulation")
+                self.assertEqual(payload["sourceDatasetId"], provenance["sourceDatasetId"])
+                self.assertEqual(payload["sourceRunId"], "run-1")
+                self.assertEqual(payload["sourceSessionId"], "source-session-1")
+                self.assertEqual(payload["sourceContentHash"], "a" * 64)
+                self.assertEqual(payload["sourceFrameContentHash"], "b" * 64)
+                self.assertTrue(payload["replayed"])
+                self.assertFalse(payload["physicalCapture"])
+                self.assertFalse(payload["synthetic"])
+            row = result.provider_row(frame, 1)
+            self.assertEqual(row["sourceDatasetId"], provenance["sourceDatasetId"])
+            self.assertFalse(row["physicalCapture"])
+            self.assertEqual(row["sourceFrameContentHash"], "b" * 64)
+
+    def test_replayed_frames_share_stable_session_hash_and_keep_frame_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            backend = LG3DReplayBackend(profile, source, speed=4.0)
+            backend.start()
+            replay_session = backend.connect(profile.enabled_cameras[0])
+            assert backend.coordinator is not None
+            assert backend.catalog is not None
+            backend.coordinator.start()
+
+            first = replay_session.fetch_frame(1_000)
+            second = replay_session.fetch_frame(1_000)
+
+            expected_session_hash = backend.catalog.sessions[0].source_content_hash
+            self.assertEqual(first.provenance["sourceContentHash"], expected_session_hash)
+            self.assertEqual(second.provenance["sourceContentHash"], expected_session_hash)
+            self.assertNotEqual(
+                first.provenance["sourceFrameContentHash"],
+                second.provenance["sourceFrameContentHash"],
+            )
+            self.assertEqual(
+                first.provenance["sourceFrameContentHash"],
+                backend.catalog.sessions[0].tracks["C1"].frames[0].source_content_hash,
+            )
+
+    def test_catalog_splits_mixed_flow_sessions_and_keeps_unequal_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "read-only-source"
+            write_simulation_fixture(source, profile)
+
+            catalog = ReplayCatalog.build(source, profile.enabled_cameras)
+            rebuilt = ReplayCatalog.build(source, profile.enabled_cameras)
+
+            self.assertEqual(catalog.candidate_session_count, 2)
+            self.assertEqual(len(catalog.sessions), 1)
+            self.assertEqual(catalog.sessions[0].session_id, "SESSION-A")
+            self.assertEqual(catalog.sessions[0].coil_id, "COIL-A")
+            self.assertEqual(
+                {key: len(track.frames) for key, track in catalog.sessions[0].tracks.items()},
+                {"C1": 2, "C2": 1},
+            )
+            self.assertEqual(catalog.sessions[0].tracks["C1"].frames[0].index, 5)
+            self.assertEqual(
+                catalog.sessions[0].tracks["C1"].frames[0].intensity_path.name,
+                "5.png",
+            )
+            self.assertEqual(catalog.source_dataset_id, rebuilt.source_dataset_id)
+            self.assertEqual(catalog.source_content_hash, rebuilt.source_content_hash)
+
+            coordinator = ReplayCoordinator(
+                catalog,
+                ["C1", "C2"],
+                speed=4.0,
+            )
+            initial_run = coordinator.status()["sourceRunId"]
+            started = coordinator.start()
+            self.assertNotEqual(started["sourceRunId"], initial_run)
+            emitted: list[tuple[str, int]] = []
+            while coordinator.status()["state"] != "completed":
+                try:
+                    due = coordinator.next_event_camera_keys(["C1", "C2"], 1_000)
+                except ReplayCompleted:
+                    break
+                for camera_key in due:
+                    emitted.append(
+                        (camera_key, coordinator.next_frame(camera_key, 1_000)[0].index)
+                    )
+            c1_frames = [index for camera, index in emitted if camera == "C1"]
+            c2_frames = [index for camera, index in emitted if camera == "C2"]
+            self.assertEqual(emitted, [("C1", 5), ("C2", 5), ("C1", 6)])
+            self.assertEqual(c1_frames, [5, 6])
+            self.assertEqual(c2_frames, [5])
+            self.assertEqual(coordinator.status()["state"], "completed")
+            completed_run = coordinator.status()["sourceRunId"]
+            reset = coordinator.reset()
+            self.assertEqual(reset["state"], "idle")
+            self.assertNotEqual(reset["sourceRunId"], completed_run)
+
+    def test_catalog_trusts_legacy_config_identity_and_rejects_swapped_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+
+            # Legacy frame metadata may omit identity when camera_config.json
+            # supplies the canonical camera key, id, and serial number.
+            for metadata_path in source.glob("C*/10/json/*.json"):
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata.pop("cameraKey", None)
+                metadata.pop("cameraId", None)
+                metadata.pop("cameraSerialNumber", None)
+                metadata_path.write_text(
+                    json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
+            catalog = ReplayCatalog.build(source, profile.enabled_cameras)
+            self.assertEqual(len(catalog.sessions), 1)
+
+            # A copied/swapped directory must not be relabelled as the profile
+            # camera merely because the legacy frame metadata has no identity.
+            c1_config = source / "C1" / "10" / "camera_config.json"
+            c2_config = source / "C2" / "10" / "camera_config.json"
+            c1_config.write_bytes(c2_config.read_bytes())
+            with self.assertRaisesRegex(
+                ValueError, "no complete multi-camera replay sessions"
+            ):
+                ReplayCatalog.build(source, profile.enabled_cameras)
+
+    def test_catalog_rejects_session_with_missing_first_frame_component(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            rows = {
+                camera: [
+                    (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                    (6, "SESSION-A", "COIL-A", 10_100_000_000),
+                    (7, "SESSION-A", "COIL-A", 10_200_000_000),
+                ]
+                for camera in ("C1", "C2")
+            }
+            write_simulation_rows(source, profile, rows)
+            (source / "C1" / "10" / "3d" / "5.npz").unlink()
+
+            with self.assertRaisesRegex(
+                ValueError, "no complete multi-camera replay sessions"
+            ):
+                ReplayCatalog.build(source, profile.enabled_cameras)
+
+    def test_catalog_rejects_session_with_missing_middle_frame_component(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            rows = {
+                camera: [
+                    (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                    (6, "SESSION-A", "COIL-A", 10_100_000_000),
+                    (7, "SESSION-A", "COIL-A", 10_200_000_000),
+                ]
+                for camera in ("C1", "C2")
+            }
+            write_simulation_rows(source, profile, rows)
+            (source / "C1" / "10" / "3d" / "6.npz").unlink()
+
+            with self.assertRaisesRegex(
+                ValueError, "no complete multi-camera replay sessions"
+            ):
+                ReplayCatalog.build(source, profile.enabled_cameras)
+
+    def test_catalog_ignores_only_one_incomplete_trailing_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            rows = {
+                camera: [
+                    (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                    (6, "SESSION-A", "COIL-A", 10_100_000_000),
+                    (7, "SESSION-A", "COIL-A", 10_200_000_000),
+                ]
+                for camera in ("C1", "C2")
+            }
+            write_simulation_rows(source, profile, rows)
+            (source / "C1" / "10" / "3d" / "7.npz").unlink()
+
+            catalog = ReplayCatalog.build(source, profile.enabled_cameras)
+            self.assertEqual(catalog.candidate_session_count, 1)
+            self.assertEqual(len(catalog.sessions), 1)
+            self.assertEqual(
+                {
+                    key: len(track.frames)
+                    for key, track in catalog.sessions[0].tracks.items()
+                },
+                {"C1": 2, "C2": 3},
+            )
+
+    def test_coordinator_emits_explicit_boundaries_without_padding_or_session_mix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_rows(
+                source,
+                profile,
+                {
+                    "C1": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-A", "COIL-A", 10_100_000_000),
+                        (7, "SESSION-B", "COIL-B", 10_200_000_000),
+                        (8, "SESSION-B", "COIL-B", 10_400_000_000),
+                    ],
+                    "C2": [
+                        (5, "SESSION-A", "COIL-A", 10_020_000_000),
+                        (6, "SESSION-B", "COIL-B", 10_230_000_000),
+                        (7, "SESSION-B", "COIL-B", 10_250_000_000),
+                    ],
+                },
+            )
+            catalog = ReplayCatalog.build(source, profile.enabled_cameras)
+            self.assertEqual(len(catalog.sessions), 2)
+            coordinator = ReplayCoordinator(
+                catalog,
+                ["C1", "C2"],
+                speed=4.0,
+                session_gap_ms=1001,
+            )
+            coordinator.start()
+
+            emissions: list[tuple[str, str, str | int]] = []
+            while True:
+                try:
+                    batch = coordinator.next_event_batch(["C1", "C2"], 1_000)
+                except ReplayCompleted:
+                    break
+                if batch["kind"] == "session-boundary":
+                    emissions.append(
+                        ("boundary", batch["completedSessionId"], "")
+                    )
+                    continue
+                batch_session_id = str(batch["sessionId"])
+                for camera_key in batch["cameraKeys"]:
+                    reference, event, _ = coordinator.next_frame(camera_key, 1_000)
+                    self.assertEqual(
+                        catalog.sessions[event.session_index].session_id,
+                        batch_session_id,
+                    )
+                    emissions.append((camera_key, batch_session_id, reference.index))
+
+            self.assertEqual(
+                emissions,
+                [
+                    ("C1", "SESSION-A", 5),
+                    ("C2", "SESSION-A", 5),
+                    ("C1", "SESSION-A", 6),
+                    ("boundary", "SESSION-A", ""),
+                    ("C1", "SESSION-B", 7),
+                    ("C2", "SESSION-B", 6),
+                    ("C2", "SESSION-B", 7),
+                    ("C1", "SESSION-B", 8),
+                    ("boundary", "SESSION-B", ""),
+                ],
+            )
+            self.assertEqual(
+                [row for row in emissions if row[0] == "C1"],
+                [
+                    ("C1", "SESSION-A", 5),
+                    ("C1", "SESSION-A", 6),
+                    ("C1", "SESSION-B", 7),
+                    ("C1", "SESSION-B", 8),
+                ],
+            )
+            self.assertEqual(
+                [row for row in emissions if row[0] == "C2"],
+                [
+                    ("C2", "SESSION-A", 5),
+                    ("C2", "SESSION-B", 6),
+                    ("C2", "SESSION-B", 7),
+                ],
+            )
+            status = coordinator.status()
+            self.assertEqual(status["state"], "completed")
+            self.assertEqual(status["candidateSessionCount"], 2)
+            self.assertEqual(status["sessionCount"], 2)
+            self.assertEqual(status["usableSessionCount"], 2)
+            self.assertEqual(status["rejectedSessionCount"], 0)
+
+    def test_provider_closes_each_source_session_before_replaying_the_next(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            ProviderRuntime,
+            "_post_service_json",
+            return_value={"code": 0},
+        ) as service_callback:
+            root = Path(directory)
+            base_profile = two_camera_profile(root)
+            capture_defaults = dict(base_profile.raw.get("captureDefaults", {}))
+            capture_defaults.update(
+                {
+                    "captureMode": "continuous",
+                    "storageProcessWorkers": 0,
+                    "storageRoundWorkers": 1,
+                }
+            )
+            profile = replace(
+                base_profile,
+                raw={**base_profile.raw, "captureDefaults": capture_defaults},
+            )
+            source = root / "source"
+            write_simulation_rows(
+                source,
+                profile,
+                {
+                    "C1": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-A", "COIL-A", 10_100_000_000),
+                        (7, "SESSION-B", "COIL-B", 10_200_000_000),
+                        (8, "SESSION-B", "COIL-B", 10_400_000_000),
+                    ],
+                    "C2": [
+                        (5, "SESSION-A", "COIL-A", 10_020_000_000),
+                        (6, "SESSION-B", "COIL-B", 10_230_000_000),
+                        (7, "SESSION-B", "COIL-B", 10_250_000_000),
+                    ],
+                },
+            )
+            runtime = ProviderRuntime(
+                profile,
+                runtime_mode="simulation",
+                simulation_source=source,
+                simulation_speed=4.0,
+                simulation_session_gap_ms=1001,
+            )
+            try:
+                service = runtime.start_service()
+                self.assertEqual(service["state"], "idle")
+                self.assertFalse(runtime._acquisition_running())
+                started = runtime.simulation_control(
+                    {
+                        "action": "start",
+                        "speed": 4.0,
+                        "sessionGapMs": 1001,
+                    }
+                )
+                self.assertEqual(started["state"], "running")
+
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline:
+                    if (
+                        runtime.simulation_status().get("state") == "completed"
+                        and not runtime._acquisition_running()
+                        and runtime._persistence_is_quiescent()
+                    ):
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(runtime.simulation_status()["state"], "completed")
+                self.assertFalse(runtime._acquisition_running())
+                self.assertTrue(runtime._persistence_is_quiescent())
+
+                self.assertEqual(set(runtime.simulation_output_flows), {0, 1})
+                first_material, first_output_session = runtime.simulation_output_flows[0]
+                second_material, second_output_session = runtime.simulation_output_flows[1]
+                self.assertNotEqual(first_material, second_material)
+                self.assertNotEqual(first_output_session, second_output_session)
+
+                observed: dict[int, dict[str, list[str]]] = {}
+                expected_counts = {
+                    0: {"C1": 2, "C2": 1},
+                    1: {"C1": 2, "C2": 2},
+                }
+                expected_source_sessions = {0: "SESSION-A", 1: "SESSION-B"}
+                for absolute_session, (material_id, _) in (
+                    runtime.simulation_output_flows.items()
+                ):
+                    observed[absolute_session] = {}
+                    for camera in profile.enabled_cameras:
+                        metadata_paths = sorted(
+                            (
+                                camera_capture_root(
+                                    camera.storage_root,
+                                    material_id,
+                                    camera.camera_id,
+                                )
+                                / "json"
+                            ).glob("*.json")
+                        )
+                        observed[absolute_session][camera.key] = [
+                            str(
+                                json.loads(path.read_text(encoding="utf-8"))[
+                                    "sourceSessionId"
+                                ]
+                            )
+                            for path in metadata_paths
+                        ]
+                        self.assertEqual(
+                            len(metadata_paths),
+                            expected_counts[absolute_session][camera.key],
+                            f"session={absolute_session} camera={camera.key}",
+                        )
+                        self.assertEqual(
+                            set(observed[absolute_session][camera.key]),
+                            {expected_source_sessions[absolute_session]},
+                        )
+                self.assertEqual(set(observed), {0, 1})
+            finally:
+                runtime.close()
+
+    def test_replay_pacing_excludes_processing_time_and_preserves_full_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_rows(
+                source,
+                profile,
+                {
+                    "C1": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-A", "COIL-A", 10_400_000_000),
+                        (7, "SESSION-B", "COIL-B", 10_500_000_000),
+                    ],
+                    "C2": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-B", "COIL-B", 10_500_000_000),
+                    ],
+                },
+            )
+            coordinator = ReplayCoordinator(
+                ReplayCatalog.build(source, profile.enabled_cameras),
+                ["C1", "C2"],
+                speed=4.0,
+                session_gap_ms=1001,
+            )
+            coordinator.start()
+
+            first = coordinator.next_event_batch(["C1", "C2"], 1_000)
+            self.assertEqual(first["cameraKeys"], ("C1", "C2"))
+            for camera_key in first["cameraKeys"]:
+                coordinator.next_frame(camera_key, 1_000)
+
+            # Simulated slow processing must not be counted as 600 ms of
+            # source-clock progress and cause the 400 ms source event to burst.
+            time.sleep(0.15)
+            event_wait_started = time.monotonic()
+            second = coordinator.next_event_batch(["C1", "C2"], 1_000)
+            event_wait_seconds = time.monotonic() - event_wait_started
+            self.assertGreaterEqual(event_wait_seconds, 0.07)
+            self.assertEqual(second["sessionId"], "SESSION-A")
+            self.assertEqual(second["cameraKeys"], ("C1",))
+            coordinator.next_frame("C1", 1_000)
+
+            boundary = coordinator.next_event_batch(["C1", "C2"], 1_000)
+            self.assertEqual(boundary["kind"], "session-boundary")
+            self.assertEqual(boundary["completedSessionId"], "SESSION-A")
+
+            # Session close/flush work likewise cannot consume any portion of
+            # the configured 1001 ms virtual gap (250.25 ms at 4x).
+            time.sleep(0.15)
+            gap_wait_started = time.monotonic()
+            next_session = coordinator.next_event_batch(["C1", "C2"], 1_000)
+            gap_wait_seconds = time.monotonic() - gap_wait_started
+            self.assertGreaterEqual(gap_wait_seconds, 0.22)
+            self.assertEqual(next_session["kind"], "frames")
+            self.assertEqual(next_session["sessionId"], "SESSION-B")
+            self.assertEqual(next_session["cameraKeys"], ("C1", "C2"))
+            for camera_key in next_session["cameraKeys"]:
+                coordinator.next_frame(camera_key, 1_000)
+
+    def test_replay_gap_heartbeat_fails_quickly_when_source_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_rows(
+                source,
+                profile,
+                {
+                    "C1": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-B", "COIL-B", 10_100_000_000),
+                    ],
+                    "C2": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-B", "COIL-B", 10_100_000_000),
+                    ],
+                },
+            )
+            coordinator = ReplayCoordinator(
+                ReplayCatalog.build(source, profile.enabled_cameras),
+                ["C1", "C2"],
+                speed=1.0,
+                session_gap_ms=3_600_000,
+            )
+            coordinator.start()
+            first = coordinator.next_event_batch(["C1", "C2"], 1_000)
+            for camera_key in first["cameraKeys"]:
+                coordinator.next_frame(camera_key, 1_000)
+            boundary = coordinator.next_event_batch(["C1", "C2"], 1_000)
+            self.assertEqual(boundary["kind"], "session-boundary")
+
+            shutil.rmtree(source)
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "source"):
+                coordinator.next_event_batch(["C1", "C2"], 5_000)
+            self.assertLess(time.monotonic() - started, 1.0)
+            status = coordinator.status()
+            self.assertEqual(status["state"], "error")
+            self.assertFalse(status["sourceAvailable"])
+
+    def test_paused_replay_status_fails_when_source_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            coordinator = ReplayCoordinator(
+                ReplayCatalog.build(source, profile.enabled_cameras),
+                ["C1", "C2"],
+            )
+            coordinator.start()
+            self.assertEqual(coordinator.pause()["state"], "paused")
+
+            shutil.rmtree(source)
+            status = coordinator.status()
+            self.assertEqual(status["state"], "error")
+            self.assertFalse(status["sourceAvailable"])
+            self.assertEqual(coordinator.resume()["error"], "simulation_not_paused")
+
+    def test_stuck_old_worker_blocks_reset_and_discards_recovered_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            ProviderRuntime,
+            "_post_service_json",
+            return_value={"code": 0},
+        ):
+            root = Path(directory)
+            base_profile = two_camera_profile(root)
+            capture_defaults = dict(base_profile.raw.get("captureDefaults", {}))
+            capture_defaults.update(
+                {
+                    "captureMode": "continuous",
+                    "storageProcessWorkers": 0,
+                }
+            )
+            profile = replace(
+                base_profile,
+                raw={**base_profile.raw, "captureDefaults": capture_defaults},
+            )
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            runtime = ProviderRuntime(
+                profile,
+                runtime_mode="simulation",
+                simulation_source=source,
+                simulation_speed=4.0,
+            )
+            release_fetch = threading.Event()
+            fetch_started = threading.Event()
+            try:
+                self.assertEqual(runtime.start_service()["state"], "idle")
+                blocked_session = runtime.sessions["C1"]
+                original_fetch = blocked_session.fetch_frame
+
+                def delayed_fetch(timeout_ms):
+                    fetch_started.set()
+                    if not release_fetch.wait(5.0):
+                        raise TimeoutError("test replay source remained blocked")
+                    return original_fetch(timeout_ms)
+
+                blocked_session.fetch_frame = delayed_fetch
+                started = runtime.simulation_control({"action": "start"})
+                self.assertEqual(started["state"], "running")
+                self.assertTrue(fetch_started.wait(2.0))
+                original_run_id = runtime.simulation_status()["sourceRunId"]
+                original_cancel = runtime._cancel_simulation_worker
+
+                def short_cancel(coordinator, _timeout_seconds):
+                    return original_cancel(coordinator, 0.05)
+
+                with patch.object(
+                    runtime,
+                    "_cancel_simulation_worker",
+                    side_effect=short_cancel,
+                ):
+                    reset = runtime.simulation_reset()
+                    self.assertEqual(reset["code"], 503)
+                    self.assertEqual(reset["error"], "simulation_not_quiesced")
+                    self.assertFalse(reset["quiesced"])
+                    self.assertEqual(
+                        runtime.simulation_status()["sourceRunId"], original_run_id
+                    )
+
+                    service_start = runtime.start_service()
+                    self.assertEqual(service_start["code"], 503)
+                    self.assertEqual(
+                        service_start["error"], "simulation_not_quiesced"
+                    )
+                    self.assertEqual(
+                        runtime.simulation_status()["sourceRunId"], original_run_id
+                    )
+
+                self.assertEqual(set(runtime.simulation_output_flows), {0})
+                blocked_material_id = runtime.simulation_output_flows[0][0]
+                release_fetch.set()
+                deadline = time.monotonic() + 2.0
+                while runtime._acquisition_running() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(runtime._acquisition_running())
+                self.assertEqual(runtime.frames_received, 1)
+                self.assertEqual(runtime.frames_committed, 0)
+                for camera in profile.enabled_cameras:
+                    self.assertEqual(
+                        list(
+                            (
+                                camera_capture_root(
+                                    camera.storage_root,
+                                    blocked_material_id,
+                                    camera.camera_id,
+                                )
+                                / "json"
+                            ).glob("*.json")
+                        ),
+                        [],
+                    )
+
+                reset_after_exit = runtime.simulation_reset()
+                self.assertEqual(reset_after_exit["code"], 0)
+                self.assertEqual(reset_after_exit["state"], "idle")
+                self.assertNotEqual(
+                    reset_after_exit["sourceRunId"], original_run_id
+                )
+            finally:
+                release_fetch.set()
+                runtime.close()
+
+    def test_simulation_storage_failure_is_sticky_and_stops_before_next_event(self) -> None:
+        class FailingReplayWriter(DualFormatWriter):
+            def write(self, *_args, **_kwargs):
+                raise OSError("simulated replay disk failure")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            ProviderRuntime,
+            "_post_service_json",
+            return_value={"code": 0},
+        ):
+            root = Path(directory)
+            base_profile = two_camera_profile(root)
+            capture_defaults = dict(base_profile.raw.get("captureDefaults", {}))
+            capture_defaults.update(
+                {
+                    "captureMode": "continuous",
+                    "storageProcessWorkers": 0,
+                }
+            )
+            profile = replace(
+                base_profile,
+                raw={**base_profile.raw, "captureDefaults": capture_defaults},
+            )
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            runtime = ProviderRuntime(
+                profile,
+                runtime_mode="simulation",
+                simulation_source=source,
+                simulation_speed=4.0,
+                writer=FailingReplayWriter(),
+            )
+            try:
+                self.assertEqual(runtime.start_service()["state"], "idle")
+                self.assertEqual(
+                    runtime.simulation_control({"action": "start"})["state"],
+                    "running",
+                )
+                deadline = time.monotonic() + 5.0
+                while (
+                    runtime.simulation_status().get("state") != "error"
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+
+                status = runtime.simulation_status()
+                self.assertEqual(status["state"], "error")
+                self.assertIn("persistence failed", status["lastError"])
+                self.assertNotEqual(status["state"], "completed")
+                coordinator = runtime.backend.coordinator
+                self.assertIsNotNone(coordinator)
+                self.assertEqual(coordinator.last_event_by_camera["C1"], 0)
+                self.assertEqual(coordinator.last_event_by_camera["C2"], -1)
+                self.assertTrue(runtime.storage_queue_last_error)
+            finally:
+                runtime.close()
+
+    def test_bad_npz_rejects_its_whole_logical_session_without_crashing_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_rows(
+                source,
+                profile,
+                {
+                    "C1": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-A", "COIL-A", 10_100_000_000),
+                        (7, "SESSION-B", "COIL-B", 10_200_000_000),
+                    ],
+                    "C2": [
+                        (5, "SESSION-A", "COIL-A", 10_000_000_000),
+                        (6, "SESSION-A", "COIL-A", 10_100_000_000),
+                        (7, "SESSION-B", "COIL-B", 10_200_000_000),
+                    ],
+                },
+            )
+            bad_npz = source / "C1" / "10" / "3d" / "6.npz"
+            bad_npz.write_bytes(b"not-a-zip-file")
+
+            catalog = ReplayCatalog.build(source, profile.enabled_cameras)
+
+            self.assertEqual(catalog.candidate_session_count, 2)
+            self.assertEqual(
+                [(session.session_id, session.coil_id) for session in catalog.sessions],
+                [("SESSION-B", "COIL-B")],
+            )
+            corrupt_errors = [
+                row
+                for row in catalog.rejected_tracks
+                if row.get("sessionId") == "SESSION-A"
+                and str(bad_npz.resolve()) in row.get("error", "")
+            ]
+            self.assertTrue(corrupt_errors)
+            self.assertIn(str(bad_npz.resolve()), corrupt_errors[0]["error"])
+
+    def test_simulation_speed_and_gap_boundaries_are_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            catalog = ReplayCatalog.build(source, profile.enabled_cameras)
+
+            ReplayCoordinator(catalog, ["C1", "C2"], speed=0.25, session_gap_ms=1001)
+            ReplayCoordinator(
+                catalog,
+                ["C1", "C2"],
+                speed=4.0,
+                session_gap_ms=3_600_000,
+            )
+            for speed in (0.249, 4.001):
+                with self.assertRaisesRegex(ValueError, "speed"):
+                    ReplayCoordinator(catalog, ["C1", "C2"], speed=speed)
+            for gap in (1000, 3_600_001):
+                with self.assertRaisesRegex(ValueError, "sessionGapMs"):
+                    ReplayCoordinator(catalog, ["C1", "C2"], session_gap_ms=gap)
+
+    def test_backend_detects_source_corruption_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            backend = LG3DReplayBackend(profile, source, speed=4.0)
+            backend.start()
+            session = backend.connect(profile.enabled_cameras[0])
+            assert backend.coordinator is not None
+            backend.coordinator.start()
+            first = session.fetch_frame(1_000)
+            self.assertEqual(first.provenance["sourceMode"], "simulation")
+            self.assertTrue(first.provenance["replayed"])
+            self.assertFalse(first.provenance["physicalCapture"])
+            self.assertFalse(first.provenance["synthetic"])
+            self.assertEqual(first.provenance["sourceFrameIndex"], 5)
+            self.assertRegex(first.provenance["sourceDatasetId"], r"^lg3d-[0-9a-f]{24}$")
+            self.assertRegex(first.provenance["sourceContentHash"], r"^[0-9a-f]{64}$")
+
+            second_reference = backend.catalog.sessions[0].tracks["C1"].frames[1]
+            second_reference.intensity_path.write_bytes(b"corrupt")
+            with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                session.fetch_frame(1_000)
+            self.assertEqual(backend.status()["state"], "error")
+            self.assertIn("hash mismatch", backend.status()["lastError"])
+
+            overlapping = replace(
+                profile,
+                storage_root=source,
+                cameras=tuple(
+                    replace(camera, storage_root=source / camera.key)
+                    for camera in profile.cameras
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "must be separate"):
+                LG3DReplayBackend(overlapping, source)
+
+    def test_catalog_rejects_declared_hash_and_array_schema_mismatches(self) -> None:
+        for failure in ("declared-hash", "depth-dtype", "intensity-shape"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = two_camera_profile(root)
+                source = root / "source"
+                write_simulation_fixture(source, profile)
+                for index in (5, 6):
+                    metadata_path = source / "C1" / "10" / "json" / f"{index}.json"
+                    if failure == "declared-hash":
+                        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                        metadata["checksums"]["lg3d3d"] = "0" * 64
+                        metadata_path.write_text(
+                            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                    elif failure == "depth-dtype":
+                        np.savez_compressed(
+                            source / "C1" / "10" / "3d" / f"{index}.npz",
+                            array=np.ones((2, 3), dtype=np.float32),
+                        )
+                    else:
+                        Image.fromarray(
+                            np.ones((2, 3, 3), dtype=np.uint8), mode="RGB"
+                        ).save(source / "C1" / "10" / "2d" / f"{index}.png")
+                with self.assertRaisesRegex(
+                    ValueError, "no complete multi-camera replay sessions"
+                ):
+                    ReplayCatalog.build(source, profile.enabled_cameras)
+
+    def test_source_root_links_and_output_link_overlap_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            source_link = root / "source-link"
+            try:
+                source_link.symlink_to(source, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks are unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "links or reparse points"):
+                ReplayCatalog.build(source_link, profile.enabled_cameras)
+
+            output_link = root / "output-link"
+            output_link.symlink_to(source, target_is_directory=True)
+            linked_output_profile = replace(
+                profile,
+                storage_root=output_link,
+                cameras=tuple(
+                    replace(camera, storage_root=output_link / camera.key)
+                    for camera in profile.cameras
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "links or reparse points"):
+                LG3DReplayBackend(linked_output_profile, source)
+
+    def test_official_simulation_http_control_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            ProviderRuntime,
+            "_post_service_json",
+            return_value={"code": 0},
+        ):
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            runtime = ProviderRuntime(
+                profile,
+                runtime_mode="simulation",
+                simulation_source=source,
+            )
+            runtime.set_capture_mode({"captureMode": "disabled"})
+            server = SickCaptureHTTPServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                def post(path: str, payload: dict[str, object]):
+                    body = json.dumps(payload).encode("utf-8")
+                    with request.urlopen(
+                        request.Request(
+                            f"{origin}{path}",
+                            data=body,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        ),
+                        timeout=2,
+                    ) as response:
+                        return json.loads(response.read())
+
+                service_started = post("/api/service/start", {})
+                self.assertEqual(service_started["state"], "idle")
+                self.assertEqual(service_started["serviceState"], "idle")
+                self.assertTrue(service_started["quiesced"])
+                with request.urlopen(
+                    f"{origin}/api/capture/simulation/status", timeout=2
+                ) as response:
+                    idle = json.loads(response.read())
+                self.assertEqual(idle["runtimeMode"], "simulation")
+                self.assertEqual(idle["state"], "idle")
+                self.assertEqual(idle["sessionCount"], 1)
+                self.assertEqual(idle["usableSessionCount"], 1)
+                self.assertEqual(idle["candidateSessionCount"], 2)
+                self.assertEqual(idle["rejectedSessionCount"], 1)
+                self.assertGreaterEqual(idle["rejectedTrackCount"], 1)
+                with request.urlopen(f"{origin}/health", timeout=2) as response:
+                    health = json.loads(response.read())
+                self.assertFalse(health["sdkRequired"])
+                self.assertIsNone(health["sdkReady"])
+                self.assertFalse(health["connected"])
+                self.assertEqual(health["cameraCount"], 0)
+                self.assertEqual(health["physicalCameraCount"], 0)
+                self.assertEqual(health["physicalCamerasOnline"], 0)
+                self.assertEqual(health["simulationChannelCount"], 2)
+                self.assertEqual(health["replayChannels"], 2)
+                with request.urlopen(f"{origin}/api/cameras", timeout=2) as response:
+                    cameras = json.loads(response.read())
+                self.assertEqual(cameras["connectedCameras"], 0)
+                self.assertEqual(cameras["physicalCameraCount"], 0)
+                self.assertEqual(cameras["simulationChannelCount"], 2)
+                self.assertEqual(cameras["replayChannels"], 2)
+                self.assertTrue(
+                    all(not camera["connected"] for camera in cameras["cameras"])
+                )
+                self.assertTrue(
+                    all(
+                        camera["replayChannelReady"]
+                        for camera in cameras["cameras"]
+                    )
+                )
+
+                def control(action: str, **values):
+                    return post(
+                        "/api/capture/simulation/control",
+                        {"action": action, **values},
+                    )
+
+                started = control(
+                    "start", speed=2.0, loop=True, sessionGapMs=2000
+                )
+                self.assertEqual(started["state"], "running")
+                self.assertEqual(started["speed"], 2.0)
+                self.assertTrue(started["loop"])
+                self.assertEqual(started["sessionGapMs"], 2000)
+                paused = control("pause")
+                self.assertEqual(paused["state"], "paused")
+                resumed = control("resume")
+                self.assertEqual(resumed["state"], "running")
+                stopped = post("/api/service/stop", {})
+                self.assertEqual(stopped["state"], "paused")
+                self.assertEqual(stopped["serviceState"], "stopped")
+                self.assertTrue(stopped["quiesced"])
+                restarted = post("/api/service/start", {})
+                self.assertEqual(restarted["state"], "idle")
+                explicitly_started = control("start")
+                self.assertEqual(explicitly_started["state"], "running")
+                run_id = explicitly_started["sourceRunId"]
+                reset = control("reset")
+                self.assertEqual(reset["state"], "idle")
+                self.assertNotEqual(reset["sourceRunId"], run_id)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_simulation_health_fails_when_source_is_removed_while_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            runtime = ProviderRuntime(
+                profile,
+                runtime_mode="simulation",
+                simulation_source=source,
+            )
+            try:
+                self.assertEqual(runtime.start_service()["state"], "idle")
+                self.assertTrue(runtime.health_json()["providerReady"])
+
+                shutil.rmtree(source)
+                health = runtime.health_json()
+                self.assertFalse(health["providerReady"])
+                self.assertFalse(health["captureReady"])
+                self.assertIn(
+                    "simulation-source-unavailable",
+                    health["readinessReasons"],
+                )
+                self.assertFalse(health["simulation"]["sourceAvailable"])
+            finally:
+                runtime.close()
+
+    def test_simulation_start_drives_replay_even_with_on_demand_capture_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            ProviderRuntime,
+            "_post_service_json",
+            return_value={"code": 0},
+        ) as service_callback:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            runtime = ProviderRuntime(
+                profile,
+                runtime_mode="simulation",
+                simulation_source=source,
+                simulation_speed=4.0,
+            )
+            runtime._commit_capture_results = (  # type: ignore[method-assign]
+                lambda *_args: True
+            )
+            try:
+                self.assertEqual(runtime.capture_mode, "on-demand")
+                self.assertEqual(runtime.start_service()["state"], "idle")
+                self.assertEqual(
+                    runtime.simulation_control({"action": "start"})["state"],
+                    "running",
+                )
+                deadline = time.monotonic() + 3.0
+                status = runtime.simulation_status()
+                while status["state"] != "completed" and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                    status = runtime.simulation_status()
+                self.assertEqual(status["state"], "completed")
+                self.assertGreater(runtime.health_json()["framesReceived"], 0)
+                callback_paths = [row.args[0] for row in service_callback.call_args_list]
+                self.assertEqual(
+                    callback_paths,
+                    ["/internal/v1/steel-in", "/internal/v1/steel-out"],
+                )
+            finally:
+                runtime.close()
+
+    def test_http_write_mode_guards_fail_closed(self) -> None:
+        def post_json(origin: str, path: str, payload: dict[str, object]):
+            body = json.dumps(payload).encode("utf-8")
+            try:
+                response = request.urlopen(
+                    request.Request(
+                        f"{origin}{path}",
+                        data=body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    ),
+                    timeout=2,
+                )
+            except HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+            with response:
+                return response.status, json.loads(response.read())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = two_camera_profile(root)
+            source = root / "source"
+            write_simulation_fixture(source, profile)
+            runtime = ProviderRuntime(
+                profile,
+                runtime_mode="simulation",
+                simulation_source=source,
+            )
+            server = SickCaptureHTTPServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                for path, payload in (
+                    ("/api/stream/start", {"cameraId": "C1"}),
+                    ("/api/steel/capture-mode", {"captureMode": "continuous"}),
+                    ("/api/config/profile/apply", {"name": profile.name}),
+                    ("/api/cameras/connect-all", {}),
+                ):
+                    with self.subTest(mode="simulation", path=path):
+                        status, result = post_json(origin, path, payload)
+                        self.assertEqual(status, 409)
+                        self.assertEqual(
+                            result["error"],
+                            "mode_simulation_physical_operation_forbidden",
+                        )
+                        self.assertEqual(result["runtimeMode"], "simulation")
+                        self.assertEqual(result["operation"], path)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = load_profile(write_profile(root))
+            runtime = ProviderRuntime(profile, runtime_mode="offline")
+            server = SickCaptureHTTPServer(("127.0.0.1", 0), runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                for path in (
+                    "/api/stream/start",
+                    "/api/steel/capture-mode",
+                    "/api/config/profile/apply",
+                    "/api/capture/simulation/control",
+                ):
+                    with self.subTest(mode="offline", path=path):
+                        status, result = post_json(
+                            origin,
+                            path,
+                            {"action": "start", "captureMode": "continuous"},
+                        )
+                        self.assertEqual(status, 409)
+                        self.assertEqual(result["error"], "mode_offline")
+                        self.assertEqual(result["runtimeMode"], "offline")
+                        self.assertEqual(result["operation"], path)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+
 class SickProviderTests(unittest.TestCase):
     def setUp(self) -> None:
         # Unit tests must never post synthetic capture commits to a developer
@@ -2109,38 +3524,60 @@ class SickProviderTests(unittest.TestCase):
             backend = FakeBackend()
             runtime = ProviderRuntime(profile, backend=backend, history_only=True)
             try:
-                self.assertTrue(backend.started)
+                self.assertFalse(backend.started)
                 self.assertEqual(runtime.sessions, {})
-                self.assertEqual(runtime.connect_all()["error"], "history_only")
+                self.assertEqual(runtime.connect_all()["error"], "mode_offline")
                 status, capture = runtime.continuous_capture({"expectedCameras": 1})
                 self.assertEqual(status, 409)
-                self.assertEqual(capture["error"], "history_only")
-                self.assertTrue(runtime.health_json()["historyOnly"])
-                self.assertEqual(runtime.health_json()["framesReceived"], 0)
+                self.assertEqual(capture["error"], "mode_offline")
+                health = runtime.health_json()
+                self.assertTrue(health["historyOnly"])
+                self.assertEqual(health["runtimeMode"], "offline")
+                self.assertTrue(health["providerReady"])
+                self.assertFalse(health["captureReady"])
+                self.assertFalse(health["sdkRequired"])
+                self.assertIsNone(health["sdkReady"])
+                self.assertFalse(health["connected"])
+                self.assertEqual(health["cameraCount"], 0)
+                self.assertEqual(health["physicalCameraCount"], 0)
+                self.assertEqual(health["physicalCamerasOnline"], 0)
+                self.assertEqual(health["simulationChannelCount"], 0)
+                self.assertEqual(health["replayChannels"], 0)
+                self.assertFalse(health["databaseCommit"]["required"])
+                self.assertEqual(
+                    health["databaseCommit"]["state"], "not-required"
+                )
+                self.assertFalse(health["storageQueue"]["required"])
+                self.assertEqual(health["storageQueue"]["state"], "not-required")
+                self.assertEqual(health["framesReceived"], 0)
+                storage = runtime.storage_json()
+                self.assertEqual(storage["code"], 0)
+                self.assertEqual(storage["status"], "not-required")
+                self.assertFalse(storage["writeRequired"])
+                self.assertFalse(profile.storage_root.exists())
             finally:
                 runtime.close()
 
-    def test_history_only_runtime_can_be_started_and_stopped_by_service_control(self) -> None:
+    def test_offline_service_control_cannot_enable_capture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             profile = load_profile(write_profile(Path(directory)))
             backend = FakeBackend()
             runtime = ProviderRuntime(profile, backend=backend, history_only=True)
             try:
                 started = runtime.start_service()
-                self.assertEqual(started["code"], 0)
-                self.assertFalse(runtime.history_only)
-                self.assertIsNotNone(runtime.service_start_thread)
-                runtime.service_start_thread.join(timeout=2)
-                self.assertEqual(runtime.service_state, "running")
-                self.assertEqual(len(runtime.sessions), 1)
-                self.assertFalse(runtime.health_json()["historyOnly"])
+                self.assertEqual(started["code"], 409)
+                self.assertEqual(started["error"], "mode_offline")
+                self.assertTrue(runtime.history_only)
+                self.assertIsNone(runtime.service_start_thread)
+                self.assertEqual(runtime.service_state, "offline")
+                self.assertEqual(runtime.sessions, {})
 
                 stopped = runtime.stop_service()
-                self.assertEqual(stopped["code"], 0)
+                self.assertEqual(stopped["code"], 409)
+                self.assertEqual(stopped["error"], "mode_offline")
                 self.assertTrue(runtime.history_only)
-                self.assertIsNotNone(runtime.service_stop_thread)
-                runtime.service_stop_thread.join(timeout=2)
-                self.assertEqual(runtime.service_state, "stopped")
+                self.assertIsNone(runtime.service_stop_thread)
+                self.assertEqual(runtime.service_state, "offline")
                 self.assertEqual(runtime.sessions, {})
                 self.assertTrue(runtime.health_json()["historyOnly"])
             finally:

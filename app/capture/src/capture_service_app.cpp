@@ -299,12 +299,20 @@ std::string driver_id_text(DriverMode mode) {
   return mode == DriverMode::Simulated ? "simulated" : "lvm-nvt";
 }
 
+bool is_offline_driver_alias(std::string value) {
+  value = trim(value);
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return value == "offline";
+}
+
 DriverMode parse_driver_mode(std::string value, DriverMode fallback = DriverMode::Lvm) {
   value = trim(value);
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
     return static_cast<char>(std::tolower(ch));
   });
-  if (value == "sim" || value == "simulated" || value == "simulation" || value == "offline") {
+  if (value == "sim" || value == "simulated" || value == "simulation") {
     return DriverMode::Simulated;
   }
   if (value == "lvm" || value == "sdk" || value == "real" || value == "hardware") {
@@ -10938,12 +10946,22 @@ int run_capture_service_app(int argc, char** argv) {
   int port = 4317;
   const char* driver_environment = std::getenv("CAPTURE_DRIVER");
   bool force_driver_mode = driver_environment && *driver_environment;
+  if (force_driver_mode && is_offline_driver_alias(driver_environment)) {
+    std::cerr << "steel_capture_service cannot start: CAPTURE_DRIVER=offline is no longer a "
+                 "simulated-driver alias; use the runtime acquisitionMode=offline fence.\n";
+    return 2;
+  }
   DriverMode driver_mode = parse_driver_mode(
       force_driver_mode ? driver_environment : "", DriverMode::Lvm);
   for (int i = 1; i + 1 < argc; ++i) {
     if (std::string(argv[i]) == "--port") {
       port = std::stoi(argv[i + 1]);
     } else if (std::string(argv[i]) == "--driver" || std::string(argv[i]) == "--driver-mode") {
+      if (is_offline_driver_alias(argv[i + 1])) {
+        std::cerr << "steel_capture_service cannot start: --driver offline is no longer a "
+                     "simulated-driver alias; use the runtime acquisitionMode=offline fence.\n";
+        return 2;
+      }
       driver_mode = parse_driver_mode(argv[i + 1], driver_mode);
       force_driver_mode = true;
     }

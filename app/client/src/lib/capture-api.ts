@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { isAcquisitionMode, type AcquisitionMode } from "./acquisition-mode";
 import {
   createAdminHeaders,
   getInspectionServiceOrigin,
@@ -33,6 +34,52 @@ export type CaptureCamera = {
 
 export type PhysicalCaptureProvider = "headless-cpp" | "external-api" | "simulated";
 
+export type CaptureSimulationState = "idle" | "running" | "paused" | "completed" | "error";
+
+export type CaptureSimulationChannel = {
+  cameraId: number | string;
+  cameraKey: string;
+  sourceFlow: string;
+  frameIndex: number;
+  sourceFrameIndex?: number | null;
+  frameCount: number;
+  completed?: boolean;
+};
+
+export type CaptureSimulationStatus = {
+  code: number;
+  runtimeMode: AcquisitionMode;
+  state: CaptureSimulationState;
+  sourceRoot: string;
+  sourceAvailable: boolean;
+  sourceDatasetId?: string | null;
+  sourceContentHash?: string | null;
+  sourceRunId?: string | null;
+  speed: number;
+  loop: boolean;
+  loopIteration?: number;
+  sessionGapMs: number;
+  sessionCount: number;
+  usableSessionCount?: number;
+  candidateSessionCount?: number;
+  rejectedSessionCount?: number;
+  rejectedTrackCount?: number;
+  currentSessionIndex: number;
+  currentSessionId: string;
+  currentCoilId: string;
+  positionMs: number;
+  durationMs: number;
+  progress: number;
+  channels: CaptureSimulationChannel[];
+  lastError: string | null;
+};
+
+export type CaptureSimulationStartInput = {
+  speed?: number;
+  loop?: boolean;
+  sessionGapMs?: number;
+};
+
 export type BkvOfflineChannel = {
   index: number;
   status: "offline";
@@ -43,6 +90,9 @@ export type PhysicalCaptureHealth = {
   service: string;
   time: string;
   provider?: PhysicalCaptureProvider;
+  runtimeMode?: AcquisitionMode;
+  simulation?: CaptureSimulationStatus;
+  sdkRequired?: true;
   sdkReady: boolean;
   sdkCode: number;
   sdkVersion?: string;
@@ -52,6 +102,36 @@ export type PhysicalCaptureHealth = {
   driverName?: string;
   cameraCount?: number;
   expectedCameras?: number;
+  physicalCameraCount?: number;
+  physicalCamerasOnline?: number;
+  simulationChannelCount?: number;
+  replayChannels?: number;
+  acquisitionSynchronization?: CaptureSynchronizationStatus;
+  imageQuality?: CaptureImageQualityStatus;
+  storageQueue?: CaptureHealthStorageQueueStatus;
+};
+
+export type NonPhysicalCaptureHealth = {
+  service: string;
+  time: string;
+  provider: 'external-api';
+  runtimeMode: 'offline' | 'simulation';
+  simulation?: CaptureSimulationStatus;
+  historyOnly?: boolean;
+  sdkRequired: false;
+  sdkReady: null;
+  sdkCode: null;
+  sdkVersion?: string;
+  connected: false;
+  ip: '';
+  driverId?: string;
+  driverName?: string;
+  cameraCount: 0;
+  expectedCameras?: number;
+  physicalCameraCount: 0;
+  physicalCamerasOnline?: number;
+  simulationChannelCount: number;
+  replayChannels?: number;
   acquisitionSynchronization?: CaptureSynchronizationStatus;
   imageQuality?: CaptureImageQualityStatus;
   storageQueue?: CaptureHealthStorageQueueStatus;
@@ -167,10 +247,12 @@ export type BkvCaptureHealth = {
   };
 };
 
-export type CaptureHealth = PhysicalCaptureHealth | BkvCaptureHealth;
+export type CaptureHealth = PhysicalCaptureHealth | NonPhysicalCaptureHealth | BkvCaptureHealth;
 
 export type CaptureCameraStatus = {
   connected: boolean;
+  replayChannelReady?: boolean;
+  simulationChannel?: boolean;
   deviceId: number;
   ip: string;
   driverId?: string;
@@ -2109,7 +2191,7 @@ function hydrateSnapshot(
     cameras,
     status:
       partial.status ??
-      statuses.find((status) => status.connected) ??
+      statuses.find((status) => status.connected || status.replayChannelReady === true) ??
       statuses[0] ??
       null,
     statuses,
@@ -2161,34 +2243,21 @@ function parseCaptureHealth(value: unknown): CaptureHealth {
       value.provider !== "headless-cpp" &&
       value.provider !== "external-api" &&
       value.provider !== "simulated") ||
-    typeof value.sdkReady !== "boolean" ||
-    typeof value.sdkCode !== "number" ||
     typeof value.connected !== "boolean" ||
     typeof value.ip !== "string"
   ) {
     throw new Error("invalid physical capture health response");
   }
-  return {
-    service: value.service,
-    time: value.time,
-    ...(value.provider !== undefined ? { provider: value.provider } : {}),
-    sdkReady: value.sdkReady,
-    sdkCode: value.sdkCode,
-    ...(typeof value.sdkVersion === "string"
-      ? { sdkVersion: value.sdkVersion }
-      : {}),
-    connected: value.connected,
-    ip: value.ip,
+  const optionalHealth = {
+    ...(typeof value.sdkVersion === "string" ? { sdkVersion: value.sdkVersion } : {}),
     ...(typeof value.driverId === "string" ? { driverId: value.driverId } : {}),
-    ...(typeof value.driverName === "string"
-      ? { driverName: value.driverName }
-      : {}),
-    ...(typeof value.cameraCount === "number"
-      ? { cameraCount: value.cameraCount }
-      : {}),
-    ...(typeof value.expectedCameras === "number"
-      ? { expectedCameras: value.expectedCameras }
-      : {}),
+    ...(typeof value.driverName === "string" ? { driverName: value.driverName } : {}),
+    ...(typeof value.cameraCount === "number" ? { cameraCount: value.cameraCount } : {}),
+    ...(typeof value.expectedCameras === "number" ? { expectedCameras: value.expectedCameras } : {}),
+    ...(typeof value.physicalCameraCount === "number" ? { physicalCameraCount: value.physicalCameraCount } : {}),
+    ...(typeof value.physicalCamerasOnline === "number" ? { physicalCamerasOnline: value.physicalCamerasOnline } : {}),
+    ...(typeof value.simulationChannelCount === "number" ? { simulationChannelCount: value.simulationChannelCount } : {}),
+    ...(typeof value.replayChannels === "number" ? { replayChannels: value.replayChannels } : {}),
     ...(isRecord(value.acquisitionSynchronization)
       ? { acquisitionSynchronization: value.acquisitionSynchronization as CaptureSynchronizationStatus }
       : {}),
@@ -2199,10 +2268,61 @@ function parseCaptureHealth(value: unknown): CaptureHealth {
       ? { storageQueue: value.storageQueue as CaptureHealthStorageQueueStatus }
       : {}),
   };
+  if (value.runtimeMode === "simulation" || value.runtimeMode === "offline") {
+    if (
+      value.provider !== "external-api" ||
+      value.sdkRequired !== false ||
+      value.sdkReady !== null ||
+      value.sdkCode !== null ||
+      value.connected !== false ||
+      value.ip !== "" ||
+      value.cameraCount !== 0 ||
+      value.physicalCameraCount !== 0 ||
+      typeof value.simulationChannelCount !== "number"
+    ) {
+      throw new Error("invalid non-physical capture health response");
+    }
+    return {
+      ...optionalHealth,
+      service: value.service,
+      time: value.time,
+      provider: "external-api",
+      runtimeMode: value.runtimeMode,
+      ...(isRecord(value.simulation) ? { simulation: value.simulation as CaptureSimulationStatus } : {}),
+      ...(typeof value.historyOnly === "boolean" ? { historyOnly: value.historyOnly } : {}),
+      sdkRequired: false,
+      sdkReady: null,
+      sdkCode: null,
+      connected: false,
+      ip: '',
+      cameraCount: 0,
+      physicalCameraCount: 0,
+      simulationChannelCount: value.simulationChannelCount,
+    };
+  }
+  if (typeof value.sdkReady !== "boolean" || typeof value.sdkCode !== "number") {
+    throw new Error("invalid physical capture health response");
+  }
+  return {
+    service: value.service,
+    time: value.time,
+    ...(value.provider !== undefined ? { provider: value.provider } : {}),
+    ...(isAcquisitionMode(value.runtimeMode) ? { runtimeMode: value.runtimeMode } : {}),
+    ...(isRecord(value.simulation) ? { simulation: value.simulation as CaptureSimulationStatus } : {}),
+    ...(value.sdkRequired === true ? { sdkRequired: true as const } : {}),
+    sdkReady: value.sdkReady,
+    sdkCode: value.sdkCode,
+    ...(typeof value.sdkVersion === "string"
+      ? { sdkVersion: value.sdkVersion }
+      : {}),
+    connected: value.connected,
+    ip: value.ip,
+    ...optionalHealth,
+  };
 }
 
 function createPhysicalCaptureDriver(
-  health: PhysicalCaptureHealth,
+  health: PhysicalCaptureHealth | NonPhysicalCaptureHealth,
   cameras: CaptureCamera[],
 ): CaptureDriverInfo {
   const fallback = createDefaultCaptureDriver();
@@ -2399,6 +2519,9 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
       statusByIp.get(camera.ip) ??
       (status.connected && status.ip === camera.ip ? status : null);
     if (backendStatus) {
+      const sourceReady = health.runtimeMode === "simulation"
+        ? backendStatus.replayChannelReady === true
+        : backendStatus.connected;
       return {
         ...createStatusFromConfig(camera, discoveredByIp.get(camera.ip)),
         ...backendStatus,
@@ -2407,12 +2530,21 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
         role: camera.role,
         configId: camera.id,
         acquisitionState: backendStatus.acquisitionState
-          ?? (backendStatus.connected ? "connected" : "offline"),
+          ?? (health.runtimeMode === "simulation" && sourceReady
+            ? "replay-ready"
+            : backendStatus.connected ? "connected" : "offline"),
         sdkStatus:
-          backendStatus.sdkStatus ?? (health.sdkReady ? "ready" : "error"),
+          backendStatus.sdkStatus
+          ?? (health.runtimeMode === "simulation"
+            ? "simulation"
+            : health.runtimeMode === "offline"
+              ? "not-required"
+              : health.sdkReady
+                ? "ready"
+                : "error"),
         error:
           backendStatus.error ??
-          (backendStatus.connected
+          (sourceReady
             ? null
             : camera.enabled
               ? "not connected"
@@ -2431,6 +2563,26 @@ export async function readCaptureSnapshot(): Promise<CaptureSnapshot> {
     statuses,
     logs,
   });
+}
+
+export function readCaptureSimulationStatus(signal?: AbortSignal) {
+  return readJson<CaptureSimulationStatus>("/api/capture/simulation/status", signal);
+}
+
+export function startCaptureSimulation(input: CaptureSimulationStartInput = {}, signal?: AbortSignal) {
+  return writeJson<CaptureSimulationStatus>("/api/capture/simulation/control", { action: "start", ...input }, signal);
+}
+
+export function pauseCaptureSimulation(signal?: AbortSignal) {
+  return writeJson<CaptureSimulationStatus>("/api/capture/simulation/control", { action: "pause" }, signal);
+}
+
+export function resumeCaptureSimulation(signal?: AbortSignal) {
+  return writeJson<CaptureSimulationStatus>("/api/capture/simulation/control", { action: "resume" }, signal);
+}
+
+export function resetCaptureSimulation(signal?: AbortSignal) {
+  return writeJson<CaptureSimulationStatus>("/api/capture/simulation/control", { action: "reset" }, signal);
 }
 
 function normalizeNumber(value: unknown) {

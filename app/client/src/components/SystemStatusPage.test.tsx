@@ -1,10 +1,11 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeviceStatus } from '../data/inspection';
-import { createEmptyCaptureSnapshot, type CaptureSnapshot } from '../lib/capture-api';
+import { createEmptyCaptureSnapshot, type CaptureSimulationStatus, type CaptureSnapshot } from '../lib/capture-api';
 import { createInitialOperationState, type OperationState } from '../state/operations';
 import {
   CaptureManagementApp,
+  SimulationControlPanel,
   SystemStatusPage,
   mergeCaptureLogEvents,
   prependBoundedCaptureLog,
@@ -101,8 +102,117 @@ it('does not expose capture management or reconstruction in a non-direct runtime
 
   expect(screen.getByRole('heading', { name: '离线运行状态' })).toBeInTheDocument();
   expect(screen.getByText('6 路配置相机')).toBeInTheDocument();
+  expect(screen.getByText('当前不启动采集；历史查询、缺陷复核、报告和配置业务保持可用。')).toBeInTheDocument();
   expect(screen.queryByText('采集管理')).not.toBeInTheDocument();
   expect(screen.queryByText('3D 重建')).not.toBeInTheDocument();
+});
+
+it('controls formal simulation playback without reporting simulated channels as online cameras', async () => {
+  let status: CaptureSimulationStatus = {
+    code: 0,
+    runtimeMode: 'simulation',
+    state: 'idle',
+    sourceRoot: 'H:/captured-data',
+    sourceAvailable: true,
+    sourceDatasetId: 'lg3d-0123456789abcdef01234567',
+    sourceContentHash: 'a'.repeat(64),
+    sourceRunId: 'run-001',
+    speed: 1,
+    loop: false,
+    sessionGapMs: 1500,
+    sessionCount: 3,
+    usableSessionCount: 27,
+    candidateSessionCount: 31,
+    rejectedSessionCount: 4,
+    rejectedTrackCount: 2,
+    currentSessionIndex: 1,
+    currentSessionId: 'SESSION-001',
+    currentCoilId: 'COIL-001',
+    positionMs: 5000,
+    durationMs: 20000,
+    progress: 0.25,
+    channels: [
+      { cameraId: 1, cameraKey: 'C1', sourceFlow: 'depth', frameIndex: 10, frameCount: 40 },
+      { cameraId: 2, cameraKey: 'C2', sourceFlow: 'depth', frameIndex: 12, frameCount: 40 },
+    ],
+    lastError: null,
+  };
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === 'POST') {
+      const action = JSON.parse(String(init.body)).action as 'start' | 'pause' | 'resume' | 'reset';
+      status = {
+        ...status,
+        state: action === 'pause' ? 'paused' : action === 'reset' ? 'idle' : 'running',
+        progress: action === 'reset' ? 0 : status.progress,
+      };
+    }
+    return jsonResponse(status);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  render(<SimulationControlPanel initialStatus={status} simulationConfig={{ configured: true, speed: 2, loop: true, interSessionGapMs: 1500 }} />);
+
+  expect(await screen.findByText('数据源就绪')).toBeInTheDocument();
+  expect(screen.getByText('lg3d-0123456789abcdef01234567')).toBeInTheDocument();
+  expect(screen.getByText('SESSION-001')).toBeInTheDocument();
+  expect(screen.getByText('27 / 31')).toBeInTheDocument();
+  expect(screen.getByText('4 会话 · 2 通道')).toBeInTheDocument();
+  expect(screen.getByText(/批次 2\/3/)).toBeInTheDocument();
+  expect(screen.getByText('11/40 帧')).toBeInTheDocument();
+  expect(screen.getByText('13/40 帧')).toBeInTheDocument();
+  expect(screen.getAllByText(/模拟通道/).length).toBeGreaterThan(0);
+  expect(screen.queryByText('在线相机')).not.toBeInTheDocument();
+  expect(screen.getByLabelText('模拟控制播放速度')).toHaveAttribute('min', '0.25');
+  expect(screen.getByLabelText('模拟控制播放速度')).toHaveAttribute('max', '4');
+  expect(screen.getByLabelText('模拟控制批次间隔')).toHaveAttribute('min', '1001');
+  fireEvent.click(screen.getByRole('button', { name: '启动' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: '暂停' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: '继续' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '继续' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: '暂停' })).toBeEnabled());
+  fireEvent.click(screen.getByRole('button', { name: '复位' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: '复位' })).toBeDisabled());
+
+  const bodies = fetchMock.mock.calls
+    .filter(([, init]) => init?.method === 'POST')
+    .map(([, init]) => JSON.parse(String(init?.body)));
+  expect(bodies).toEqual([
+    { action: 'start', speed: 2, loop: true, sessionGapMs: 1500 },
+    { action: 'pause' },
+    { action: 'resume' },
+    { action: 'reset' },
+  ]);
+});
+
+it('keeps the development simulated provider separate from formal data replay', () => {
+  const capture = createEmptyCaptureSnapshot(null);
+  capture.health = {
+    service: 'steel-capture-simulated',
+    time: '2026-09-01T00:00:00Z',
+    provider: 'simulated',
+    sdkReady: false,
+    sdkCode: 0,
+    connected: false,
+    ip: '',
+    driverId: 'simulated',
+  };
+  capture.cameras = capture.cameras.map((camera) => ({
+    ...camera,
+    driverId: 'simulated',
+    source: 'service-fallback',
+  }));
+  capture.statuses = capture.statuses.map((camera) => ({
+    ...camera,
+    driverId: 'simulated',
+    sdkStatus: 'simulation',
+  }));
+  const fetchMock = vi.fn(async () => jsonResponse({ code: 0 }));
+
+  renderCaptureManagement(fetchMock, capture);
+
+  expect(screen.queryByLabelText('模拟采集控制')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '状态总览' })).toBeInTheDocument();
 });
 
 describe('CaptureManagementApp production trigger flow', () => {

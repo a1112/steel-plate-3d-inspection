@@ -137,6 +137,56 @@ button {
   transition: border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
 }
 
+.app-footer-runtime-mode {
+  height: 24px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.app-footer-runtime-mode i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--green) 78%, transparent);
+}
+
+.app-footer-runtime-mode span {
+  color: var(--faint);
+}
+
+.app-footer-runtime-mode strong {
+  color: var(--green);
+  font-size: 12px;
+}
+
+.app-footer-runtime-mode.mode-offline i {
+  background: var(--amber);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--amber) 78%, transparent);
+}
+
+.app-footer-runtime-mode.mode-offline strong {
+  color: var(--amber);
+}
+
+.app-footer-runtime-mode.mode-simulation i {
+  background: var(--cyan);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--cyan) 78%, transparent);
+}
+
+.app-footer-runtime-mode.mode-simulation strong {
+  color: var(--cyan);
+}
+
 .app-footer-connection:hover {
   border-color: color-mix(in srgb, var(--blue) 55%, var(--line));
   background: color-mix(in srgb, var(--blue) 8%, var(--panel-soft));
@@ -6304,6 +6354,41 @@ button {
   font-weight: 900;
 }
 
+.record-source-badge {
+  max-width: 100%;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.record-source-badge.production {
+  border-color: color-mix(in srgb, var(--green) 42%, var(--line));
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 9%, transparent);
+}
+
+.record-source-badge.simulation {
+  border-color: color-mix(in srgb, var(--orange) 48%, var(--line));
+  color: var(--orange);
+  background: color-mix(in srgb, var(--orange) 10%, transparent);
+}
+
+.record-source-badge.history {
+  border-color: color-mix(in srgb, var(--muted) 42%, var(--line));
+}
+
 .records-empty-row td {
   height: 90px;
   color: var(--muted);
@@ -6334,6 +6419,12 @@ button {
 
 .records-table th:nth-child(5),
 .records-table td:nth-child(5) {
+  width: 96px;
+  text-align: left;
+}
+
+.records-table th:nth-child(6),
+.records-table td:nth-child(6) {
   width: 52px;
   text-align: center;
 }
@@ -10977,6 +11068,153 @@ button {
   font-style: normal;
 }
 
+.runtime-acquisition-mode {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-soft) 86%, transparent);
+}
+
+.runtime-acquisition-mode > header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-acquisition-mode > header div {
+  display: grid;
+  gap: 2px;
+}
+
+.runtime-acquisition-mode > header span,
+.runtime-acquisition-mode > header em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.runtime-acquisition-mode > header strong {
+  color: var(--text);
+  font-size: 18px;
+}
+
+.runtime-acquisition-mode-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-acquisition-mode-options button {
+  min-width: 0;
+  min-height: 70px;
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--surface-input);
+  text-align: left;
+  cursor: pointer;
+}
+
+.runtime-acquisition-mode-options button span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.runtime-acquisition-mode-options button:hover,
+.runtime-acquisition-mode-options button.active {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  box-shadow: inset 3px 0 var(--blue);
+}
+
+.runtime-acquisition-mode-note {
+  border: 1px solid color-mix(in srgb, var(--warning) 42%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 10px;
+}
+
+.runtime-acquisition-mode-options button:nth-child(2).active {
+  border-color: var(--amber);
+  box-shadow: inset 3px 0 var(--amber);
+}
+
+.runtime-acquisition-mode-options button:nth-child(3).active {
+  border-color: var(--cyan);
+  box-shadow: inset 3px 0 var(--cyan);
+}
+
+.runtime-acquisition-mode-options button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.runtime-simulation-form {
+  display: grid;
+  grid-template-columns: minmax(280px, 2fr) repeat(2, minmax(130px, 0.65fr)) minmax(150px, 0.55fr);
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.runtime-simulation-form label {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.runtime-simulation-form input {
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-input);
+}
+
+.runtime-simulation-source > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 6px;
+}
+
+.runtime-simulation-source button {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  cursor: pointer;
+}
+
+.runtime-simulation-loop {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+}
+
+.runtime-simulation-loop input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
 .runtime-profile-camera-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
@@ -11070,6 +11308,29 @@ button {
   border-radius: 7px;
   color: var(--amber);
   background: rgba(255, 191, 38, 0.09);
+}
+
+.runtime-profile-restart-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-profile-restart-notice button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--amber);
+  border-radius: 6px;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.runtime-profile-restart-notice button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .runtime-profile-message.error {
@@ -12977,7 +13238,7 @@ button {
 
 .admin-record-table {
   width: 100%;
-  min-width: 920px;
+  min-width: 1080px;
   border-collapse: collapse;
 }
 
@@ -13055,7 +13316,7 @@ button {
 .admin-record-detail-head {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) auto auto;
   gap: 10px;
   align-items: center;
 }
@@ -13848,6 +14109,11 @@ button {
 
 .density-compact .records-table th:nth-child(5),
 .density-compact .records-table td:nth-child(5) {
+  width: 84px;
+}
+
+.density-compact .records-table th:nth-child(6),
+.density-compact .records-table td:nth-child(6) {
   width: 52px;
 }
 
@@ -14021,6 +14287,11 @@ button {
 
 .density-dense .records-table th:nth-child(5),
 .density-dense .records-table td:nth-child(5) {
+  width: 74px;
+}
+
+.density-dense .records-table th:nth-child(6),
+.density-dense .records-table td:nth-child(6) {
   width: 52px;
 }
 
@@ -16051,6 +16322,298 @@ button {
 
 .theme-light .capture-mode-banner span {
   color: #7d6130;
+}
+
+.simulation-control-panel {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(260px, 0.8fr) minmax(340px, 1.2fr);
+  grid-auto-rows: min-content;
+  align-content: start;
+  gap: 12px;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 52%, var(--line));
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--cyan) 8%, transparent), transparent 52%),
+    var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.simulation-control-panel > header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.simulation-control-panel > header div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.simulation-control-panel > header span,
+.simulation-source-summary span,
+.simulation-control-settings span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.simulation-control-panel > header strong {
+  color: var(--cyan);
+  font-size: 20px;
+}
+
+.simulation-control-panel > header em {
+  padding: 4px 8px;
+  border: 1px solid var(--green);
+  border-radius: 999px;
+  color: var(--green);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 900;
+}
+
+.simulation-control-panel > header em.warning {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.simulation-source-summary {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.simulation-source-summary strong {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.simulation-source-summary em {
+  color: var(--cyan);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.simulation-source-evidence {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 3px 0;
+}
+
+.simulation-source-evidence > div {
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+}
+
+.simulation-source-evidence dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.simulation-source-evidence dd {
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.simulation-progress {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+}
+
+.simulation-progress > div {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.simulation-progress strong {
+  color: var(--cyan);
+}
+
+.simulation-progress > i {
+  height: 8px;
+  display: block;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-input);
+}
+
+.simulation-progress > i::after {
+  content: '';
+  width: var(--simulation-progress, 0%);
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--blue), var(--cyan));
+  box-shadow: 0 0 10px color-mix(in srgb, var(--cyan) 55%, transparent);
+  transition: width 0.2s ease;
+}
+
+.simulation-progress p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.simulation-control-settings {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(140px, 0.5fr)) minmax(130px, 0.35fr);
+  gap: 8px;
+}
+
+.simulation-control-settings label {
+  display: grid;
+  gap: 5px;
+}
+
+.simulation-control-settings input[type='number'] {
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-input);
+}
+
+.simulation-loop-control {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  align-content: end;
+  min-height: 34px;
+}
+
+.simulation-loop-control input {
+  width: 16px;
+  height: 16px;
+}
+
+.simulation-control-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 8px;
+}
+
+.simulation-control-actions button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-input);
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.simulation-control-actions button.primary {
+  color: #fff;
+  border-color: var(--blue);
+  background: var(--blue);
+}
+
+.simulation-control-actions button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.simulation-channel-grid {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+
+.simulation-channel-grid > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 34%, var(--line));
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.simulation-channel-grid strong,
+.simulation-channel-grid span,
+.simulation-channel-grid em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.simulation-channel-grid strong {
+  color: var(--text);
+}
+
+.simulation-channel-grid span,
+.simulation-channel-grid em,
+.simulation-empty-channels {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.simulation-empty-channels {
+  grid-column: 1 / -1;
+  padding: 18px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  text-align: center;
+}
+
+.simulation-control-error,
+.simulation-control-message {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 7px 9px;
+  border-radius: 6px;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 9%, transparent);
+  font-size: 12px;
+}
+
+.simulation-control-message {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 9%, transparent);
+}
+
+.capture-terminal-overview-panel .simulation-control-panel {
+  height: calc(100% - 70px);
+  box-shadow: none;
 }
 
 .capture-terminal-page {

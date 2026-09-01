@@ -3,6 +3,23 @@ import {
   getInspectionServiceOrigin,
   readAdminErrorMessage,
 } from './inspection-api';
+import type { AcquisitionMode } from '../lib/acquisition-mode';
+
+export type { AcquisitionMode } from '../lib/acquisition-mode';
+
+export type RuntimeSimulationConfig = {
+  sourceRoot: string;
+  speed: number;
+  loop: boolean;
+  interSessionGapMs: number;
+};
+
+export type PublicRuntimeSimulationConfig = {
+  configured: boolean;
+  speed: number;
+  loop: boolean;
+  interSessionGapMs: number;
+};
 
 export type RuntimeCapabilities = {
   directCamera: boolean;
@@ -34,6 +51,8 @@ export type RuntimeProfileDocument = {
   dataSource: string;
   cameraConnection: string;
   cameraCount: number;
+  acquisitionMode?: AcquisitionMode;
+  simulation?: RuntimeSimulationConfig;
   captureProfile?: string;
   cameras: RuntimeCamera[];
   storage: RuntimeStorage;
@@ -51,6 +70,8 @@ export type PublicRuntimeProfile = {
   dataSource: string;
   cameraConnection: string;
   cameraCount: number;
+  acquisitionMode?: AcquisitionMode;
+  simulation?: PublicRuntimeSimulationConfig;
   cameras: RuntimeCamera[];
   configHash: string;
   capabilities: RuntimeCapabilities;
@@ -73,13 +94,38 @@ export type RuntimeProfileValidationResult = {
   restartRequired: boolean;
 };
 
-export type RuntimeProfileSaveResult = {
+type RuntimeProfileSaveResultBase = {
   saved: boolean;
   profileId: string;
   activeConfigHash: string;
   savedConfigHash: string;
   restartRequired: boolean;
+  targetAcquisitionMode: AcquisitionMode;
+  recoveryRequired: boolean;
+  detail?: string;
 };
+
+export type RuntimeProfileSaveResult = RuntimeProfileSaveResultBase & (
+  | {
+      modeTransitionAccepted: false;
+      modeTransitionCommitted: true;
+      modeTransitionState: 'committed';
+      transitionId: null;
+      releaseAfterMillis?: null;
+    }
+  | {
+      modeTransitionAccepted: true;
+      modeTransitionCommitted: false;
+      modeTransitionState:
+        | 'ready'
+        | 'metadata-committed-recovery-required'
+        | 'publish-pending-recovery'
+        | 'ready-pending-recovery';
+      transitionId: string;
+      releaseAfterMillis?: number | null;
+      admissionClosed?: boolean;
+    }
+);
 
 export type BkvImportJob = {
   id: string;

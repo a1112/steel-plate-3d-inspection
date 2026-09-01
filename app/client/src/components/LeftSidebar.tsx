@@ -2,6 +2,8 @@ import { AlertTriangle, RefreshCw, RotateCcw, Search } from 'lucide-react';
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type UIEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { InspectionRecord, InspectionSummary, PlateInspection, SteelPlate } from '../data/inspection';
+import type { AcquisitionMode } from '../lib/acquisition-mode';
+import { inspectionSourcePresentation } from '../lib/inspection-source';
 import { fetchInspectionWorldMeta, type InspectionWorldMeta } from '../services/inspection-world-api';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
 import type { DiameterMetricSummary } from './DiameterTrendPanel';
@@ -57,7 +59,9 @@ function formatDiameterMetric(value: number | null) {
 }
 
 interface LeftSidebarProps {
-  runtimeMode?: 'online' | 'bkv';
+  runtimeMode?: AcquisitionMode;
+  bkvSource?: boolean;
+  legacyBkv?: boolean;
   plate: SteelPlate;
   summary: InspectionSummary;
   activeRecordStatus?: InspectionRecord['status'];
@@ -111,6 +115,8 @@ function SidebarAlertCard({
 
 export function LeftSidebar({
   runtimeMode = 'online',
+  bkvSource = false,
+  legacyBkv = false,
   plate,
   summary,
   activeRecordStatus = 'completed',
@@ -129,7 +135,7 @@ export function LeftSidebar({
   onSearchChange,
   onSearchReset,
 }: LeftSidebarProps) {
-  const cacheStatusEnabled = showCacheStatus ?? runtimeMode === 'bkv';
+  const cacheStatusEnabled = showCacheStatus ?? (runtimeMode === 'offline' && bkvSource);
   const [activeSearchField, setActiveSearchField] = useState<RecordSearchField>('serialNo');
   const [searchOpen, setSearchOpen] = useState(false);
   const [hoveredRecord, setHoveredRecord] = useState<{ record: InspectionRecord; left: number; top: number } | null>(null);
@@ -224,13 +230,23 @@ export function LeftSidebar({
 
   return (
     <aside className={`left-column runtime-${runtimeMode}`}>
-      {runtimeMode === 'bkv' ? (
+      {runtimeMode === 'offline' ? (
         <div className="sidebar-data-source" role="note">
           <div>
-            <strong>来源：BKV 标准离线仓库</strong>
-            <span>转换后标准数据 · 只读观察</span>
+            <strong>来源：{bkvSource ? 'BKV 标准离线仓库' : '本机历史数据'}</strong>
+            <span>{bkvSource
+              ? legacyBkv ? '转换后标准数据 · 只读观察' : '转换后标准数据 · 历史业务可用'
+              : '历史检测记录 · 业务功能可用'}</span>
           </div>
-          <b>硬件控制已禁用</b>
+          <b>{bkvSource ? '硬件控制已禁用' : '采集已禁用'}</b>
+        </div>
+      ) : runtimeMode === 'simulation' ? (
+        <div className="sidebar-data-source simulation" role="note">
+          <div>
+            <strong>来源：已采集数据模拟运行</strong>
+            <span>模拟通道 · 非物理相机</span>
+          </div>
+          <b>生产硬件控制已隔离</b>
         </div>
       ) : null}
       <SidebarAlertCard summary={summary} detecting={activeRecordStatus === 'detecting'} />
@@ -380,13 +396,15 @@ export function LeftSidebar({
                 <th>板号</th>
                 <th>时间</th>
                 <th>状态</th>
+                <th>来源</th>
                 <th>缺陷数量</th>
               </tr>
             </thead>
             <tbody>
               {records.length > 0 ? (
-                visibleRecords.map((record) => (
-                  <tr
+                visibleRecords.map((record) => {
+                  const source = inspectionSourcePresentation(record);
+                  return <tr
                     key={record.id}
                     tabIndex={0}
                     className={record.id === selectedRecordId || record.plateNo === selectedRecordId ? 'selected' : ''}
@@ -402,19 +420,22 @@ export function LeftSidebar({
                     <td title={record.id}>{record.id}</td>
                     <td>{record.time}</td>
                     <td className={record.status === 'detecting' ? 'detecting' : 'completed'}>
-                      {record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? '旧记录' : '已完成'}
+                      {record.status === 'detecting' ? '检测中' : bkvSource ? '旧记录' : '已完成'}
+                    </td>
+                    <td>
+                      <span className={`record-source-badge ${source.tone}`} title={source.title}>{source.label}</span>
                     </td>
                     <td>{record.status === 'detecting' ? '检测中' : record.defectCount}</td>
-                  </tr>
-                ))
+                  </tr>;
+                })
               ) : (
                 <tr className="records-empty-row">
-                  <td colSpan={5}>无匹配记录</td>
+                  <td colSpan={6}>无匹配记录</td>
                 </tr>
               )}
               {visibleRecords.length < records.length ? (
                 <tr className="records-load-more-row">
-                  <td colSpan={5}>
+                  <td colSpan={6}>
                     <button
                       type="button"
                       aria-label="加载更多检测记录"
@@ -442,7 +463,8 @@ export function LeftSidebar({
           </header>
           <dl>
             <div><dt>检测时间</dt><dd>{hoveredRecord.record.time}</dd></div>
-            <div><dt>记录状态</dt><dd className={hoveredRecord.record.status}>{hoveredRecord.record.status === 'detecting' ? '检测中' : runtimeMode === 'bkv' ? 'BKV 旧记录' : '已完成'}</dd></div>
+            <div><dt>记录状态</dt><dd className={hoveredRecord.record.status}>{hoveredRecord.record.status === 'detecting' ? '检测中' : bkvSource ? 'BKV 旧记录' : '已完成'}</dd></div>
+            <div><dt>记录来源</dt><dd><span className={`record-source-badge ${inspectionSourcePresentation(hoveredRecord.record).tone}`} title={inspectionSourcePresentation(hoveredRecord.record).title}>{inspectionSourcePresentation(hoveredRecord.record).label}</span></dd></div>
             {cacheStatusEnabled ? <div><dt>数据缓存</dt><dd>{cacheStatusLabel(hoveredCacheProbe)}</dd></div> : null}
             <div><dt>缺陷总数</dt><dd>{hoveredRecord.record.status === 'detecting' ? '检测中' : hoveredRecord.record.defectCount}</dd></div>
             <div><dt>采集产物</dt><dd>{hoveredInspection?.captureImages?.length ?? 0} 件</dd></div>

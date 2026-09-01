@@ -174,7 +174,17 @@ export interface CaptureImageItem {
   createdAt: string;
 }
 
-export interface InspectionRecord {
+export interface InspectionSourceEvidence {
+  sourceMode?: 'online' | 'offline' | 'simulation' | 'unknown' | 'legacy_unknown' | string;
+  sourceDatasetId?: string;
+  sourceRunId?: string;
+  sourceSessionId?: string;
+  sourceContentHash?: string;
+  replayed?: boolean;
+  productionEligible?: boolean;
+}
+
+export interface InspectionRecord extends InspectionSourceEvidence {
   id: string;
   time: string;
   plateNo: string;
@@ -222,7 +232,7 @@ export interface InspectionSnapshot {
   comparison?: DefectComparison | null;
 }
 
-export interface PlateInspection {
+export interface PlateInspection extends InspectionSourceEvidence {
   plate: SteelPlate;
   defects: DefectItem[];
   heightProfile: ChartPoint[];

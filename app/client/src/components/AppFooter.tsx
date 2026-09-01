@@ -17,6 +17,7 @@ import { notify } from '../state/notifications';
 import type { AnalysisViewMode } from './AlarmAnalysis';
 import type { NavKey } from './TopNav';
 import { DEFAULT_SYSTEM_NAME } from '../lib/system-brand';
+import { acquisitionModeLabel } from '../lib/acquisition-mode';
 import { SoftwareUpdateDialog } from './SoftwareUpdateDialog';
 import { ServiceStatusDialog } from './ServiceStatusDialog';
 
@@ -67,6 +68,7 @@ interface AppFooterProps {
 
 const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
   kind: 'direct',
+  acquisitionMode: 'online',
   cameraCount: 8,
   requestsOnlineServices: true,
   requestsStandardRecords: false,
@@ -74,6 +76,12 @@ const DEFAULT_DIRECT_DASHBOARD_MODE: RuntimeDashboardMode = {
   showsCaptureManagement: true,
   showsReconstruction: true,
   supportsOfflineReplay: false,
+  acquisitionDisabled: false,
+  allowsAcquisitionWrites: true,
+  readOnly: false,
+  usesPhysicalHardware: true,
+  usesSimulationSource: false,
+  allowsProductionWrites: true,
 };
 
 const bkvAnalysisViewOptions: Array<{ id: AnalysisViewMode; label: string }> = [
@@ -197,6 +205,11 @@ export function AppFooter({
   return (
     <>
       <footer className={`app-footer ${visibleAnalysis ? 'has-analysis-context' : ''}`} data-no-drag>
+      <div className={`app-footer-runtime-mode mode-${dashboardMode.acquisitionMode}`} aria-label={`运行模式：${acquisitionModeLabel(dashboardMode.acquisitionMode)}`}>
+        <i aria-hidden="true" />
+        <span>运行模式</span>
+        <strong>{acquisitionModeLabel(dashboardMode.acquisitionMode)}</strong>
+      </div>
       {connection ? (
         <button
           type="button"

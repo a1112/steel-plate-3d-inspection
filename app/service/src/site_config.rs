@@ -1195,6 +1195,7 @@ fn runtime_template(id: &str, display_name: &str, mode: &SiteMode) -> Value {
         "schema": "steel.runtime-profile.v1",
         "id": id,
         "displayName": display_name,
+        "acquisitionMode": if mode == &SiteMode::Bkv { "offline" } else { "online" },
         "provider": provider,
         "dataSource": if mode == &SiteMode::Bkv { "converted-local" } else { "online-production" },
         "cameraConnection": camera_connection,
@@ -1304,6 +1305,7 @@ mod tests {
     };
     use crate::runtime_profile::RuntimeProfile;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::io::{Cursor, Write};
     use std::path::PathBuf;
@@ -1736,6 +1738,24 @@ mod tests {
             .expect("direct site package");
         let target = sites_root.join("direct-eight");
         super::copy_directory(&created.root, &target).expect("copy site below config root");
+        let cti_path = fixture.root.join("vendor/SICKGigEVisionTL.cti");
+        fs::create_dir_all(cti_path.parent().expect("CTI parent")).expect("CTI fixture directory");
+        let cti_bytes = b"fixture SICK GenTL producer";
+        fs::write(&cti_path, cti_bytes).expect("CTI fixture");
+        let capture_path = target.join("capture.json");
+        let mut capture: serde_json::Value =
+            serde_json::from_slice(&fs::read(&capture_path).expect("created capture profile"))
+                .expect("created capture JSON");
+        capture["driverMode"] = json!("sick-gentl");
+        capture["sick"] = json!({
+            "ctiPath": cti_path.display().to_string(),
+            "ctiSha256": format!("{:x}", Sha256::digest(cti_bytes))
+        });
+        fs::write(
+            &capture_path,
+            serde_json::to_vec_pretty(&capture).expect("capture JSON"),
+        )
+        .expect("capture profile fixture");
         fs::write(
             &project,
             serde_json::to_vec_pretty(&json!({

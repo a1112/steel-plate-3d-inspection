@@ -55,6 +55,41 @@ describe('LiveMonitoringPage', () => {
     vi.clearAllMocks();
   });
 
+  it('labels replay sources as simulated channels instead of physical cameras', () => {
+    render(<LiveMonitoringPage statuses={statuses.map((status) => ({
+      ...status,
+      connected: false,
+      replayChannelReady: true,
+      simulationChannel: true,
+      streamRunning: true,
+      streamFrames: 1,
+    }))} health={{
+      service: 'steel_sick_capture_sidecar',
+      time: '2026-08-31T12:00:00Z',
+      provider: 'external-api',
+      runtimeMode: 'simulation',
+      sdkRequired: false,
+      sdkReady: null,
+      sdkCode: null,
+      connected: false,
+      ip: '',
+      cameraCount: 0,
+      expectedCameras: 6,
+      physicalCameraCount: 0,
+      simulationChannelCount: 2,
+    }} simulation />);
+
+    expect(screen.getByRole('heading', { name: '模拟通道监控' })).toBeInTheDocument();
+    expect(screen.getByText('模拟通道实时画面')).toBeInTheDocument();
+    expect(screen.getByLabelText('模拟通道实时画面网格')).toBeInTheDocument();
+    expect(screen.getByText('2/6')).toBeInTheDocument();
+    expect(screen.getAllByText('运行')).toHaveLength(2);
+    expect(document.querySelectorAll('.live-monitor-grid-card.online')).toHaveLength(2);
+    expect(screen.queryByText('相机在线')).not.toBeInTheDocument();
+    expect(screen.queryByText('192.168.101.144')).not.toBeInTheDocument();
+    expect(screen.queryByText('192.168.102.206')).not.toBeInTheDocument();
+  });
+
   it('keeps the decoded frame visible until the next image has loaded', async () => {
     const onFrame = vi.fn();
     const onError = vi.fn();

@@ -11,6 +11,7 @@ from .gentl import probe_cti, write_probe_result
 from .profile import load_profile
 from .provider import ProviderRuntime, serve
 from .replay import validate_lg3d_dataset
+from .runtime_mode import RUNTIME_MODES
 
 
 def _print(payload: object) -> None:
@@ -86,13 +87,53 @@ def validate_main(argv: Sequence[str] | None = None) -> int:
 def service_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the steel-compatible SICK GenTL sidecar")
     parser.add_argument("--profile", required=True, type=Path)
+    parser.add_argument(
+        "--runtime-profile",
+        type=Path,
+        help="runtime.json providing acquisitionMode and simulation settings",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=RUNTIME_MODES,
+        help="capture mode; overrides runtime-profile acquisitionMode",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4317)
     parser.add_argument(
         "--history-only",
         action="store_true",
-        help="serve historical indexes and files without connecting capture devices",
+        help="legacy alias for --mode offline",
+    )
+    parser.add_argument(
+        "--simulation-source",
+        type=Path,
+        help="read-only LG_3D dataset root; overrides runtime profile",
+    )
+    parser.add_argument("--simulation-speed", type=float)
+    simulation_loop = parser.add_mutually_exclusive_group()
+    simulation_loop.add_argument(
+        "--simulation-loop", dest="simulation_loop", action="store_true"
+    )
+    simulation_loop.add_argument(
+        "--no-simulation-loop", dest="simulation_loop", action="store_false"
+    )
+    parser.set_defaults(simulation_loop=None)
+    parser.add_argument(
+        "--simulation-session-gap-ms",
+        type=int,
+        help="virtual gap between source sessions",
     )
     args = parser.parse_args(argv)
-    serve(args.profile, args.host, args.port, history_only=args.history_only)
+    serve(
+        args.profile,
+        args.host,
+        args.port,
+        history_only=args.history_only,
+        runtime_profile=args.runtime_profile,
+        runtime_mode=args.mode,
+        simulation_source=args.simulation_source,
+        simulation_speed=args.simulation_speed,
+        simulation_loop=args.simulation_loop,
+        simulation_session_gap_ms=args.simulation_session_gap_ms,
+    )
     return 0

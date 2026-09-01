@@ -27,6 +27,7 @@ const defect: DefectItem = {
 
 const bkvDashboardMode: RuntimeDashboardMode = {
   kind: 'bkv',
+  acquisitionMode: 'offline',
   cameraCount: 6,
   requestsOnlineServices: false,
   requestsStandardRecords: true,
@@ -34,6 +35,12 @@ const bkvDashboardMode: RuntimeDashboardMode = {
   showsCaptureManagement: false,
   showsReconstruction: false,
   supportsOfflineReplay: true,
+  acquisitionDisabled: true,
+  allowsAcquisitionWrites: false,
+  readOnly: true,
+  usesPhysicalHardware: false,
+  usesSimulationSource: false,
+  allowsProductionWrites: false,
 };
 
 const fullResourceUsage: AppResourceUsage = {
@@ -73,6 +80,7 @@ describe('AppFooter', () => {
     );
 
     const connectionButton = screen.getByRole('button', { name: '服务连接：已连接，IP 127.0.0.1:4873' });
+    expect(screen.getByLabelText('运行模式：在线（真实相机）')).toHaveClass('mode-online');
     expect(connectionButton).toHaveTextContent('连接 IP127.0.0.1:4873已连接');
     fireEvent.click(connectionButton);
     expect(onConnectionSettingsOpen).toHaveBeenCalledTimes(1);
@@ -108,6 +116,28 @@ describe('AppFooter', () => {
     );
 
     expect(screen.getByLabelText('服务连接：已连接·降级，IP 127.0.0.1:4873')).toHaveClass('warning');
+  });
+
+  it('renders a distinct simulation runtime badge', () => {
+    render(
+      <AppFooter
+        activeNav="online"
+        dashboardMode={{
+          ...bkvDashboardMode,
+          kind: 'direct',
+          acquisitionMode: 'simulation',
+          acquisitionDisabled: false,
+          allowsAcquisitionWrites: true,
+          readOnly: false,
+          usesSimulationSource: true,
+          allowsProductionWrites: true,
+        }}
+        onNavChange={vi.fn()}
+        onSettingsOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('运行模式：模拟（数据回放）')).toHaveClass('mode-simulation');
   });
 
   it('shows compact full-desktop resource usage with runtime details', () => {

@@ -79,6 +79,7 @@ import {
   calculateSystemNetworkRates,
   createEmptyCaptureSnapshot,
   readCaptureSnapshot,
+  readCaptureSimulationStatus,
   readCaptureMeasurement,
   readCaptureSurface,
   type CaptureFlowMeasurement,
@@ -136,6 +137,7 @@ import { inferNotificationTone, notify } from './state/notifications';
 import { resolveAppRoute, type AppRoute } from './lib/app-windows';
 import {
   fetchRuntimeProfile,
+  type AcquisitionMode,
   type PublicRuntimeProfile,
 } from './services/runtime-profile-api';
 import {
@@ -143,6 +145,7 @@ import {
   type RuntimeDashboardMode,
 } from './lib/runtime-dashboard-mode';
 import { resolveSystemName } from './lib/system-brand';
+import { connectionModeLabel } from './lib/connection-mode';
 import './styles.css';
 
 const LATEST_DATA_REFRESH_MS = 2_000;
@@ -152,6 +155,30 @@ import './styles/theme-system.css';
 const REPORT_PAGE_SIZE = 8;
 const ALL_SEVERITY_FILTERS: Severity[] = ['severe', 'review', 'minor'];
 const UNKNOWN_SERVICE_ENDPOINT = 'unknown';
+
+export type SystemSelfCheckTarget = 'inspection' | 'capture' | 'trigger' | 'simulation' | 'processing';
+
+export function getSystemSelfCheckPlan(acquisitionMode: AcquisitionMode): {
+  targets: SystemSelfCheckTarget[];
+  successMessage: string;
+} {
+  if (acquisitionMode === 'offline') {
+    return {
+      targets: ['inspection'],
+      successMessage: '系统自检已完成，业务与历史服务可达',
+    };
+  }
+  if (acquisitionMode === 'simulation') {
+    return {
+      targets: ['inspection', 'simulation', 'processing'],
+      successMessage: '系统自检已完成，业务、模拟数据源和处理链均可达',
+    };
+  }
+  return {
+    targets: ['inspection', 'capture', 'trigger'],
+    successMessage: '系统自检已完成，Rust、采集和触发服务均可达',
+  };
+}
 
 function captureSurfaceMesh(surface: CaptureFlowSurface): BarSurfaceMesh {
   const { rows, columns } = surface.mesh;
@@ -259,11 +286,12 @@ function createDisconnectedRuntimeProfile(): PublicRuntimeProfile {
   return {
     schema: 'steel.runtime-profile.public.v1',
     profileId: 'disconnected-direct-8',
-    displayName: '八相机在线检测',
+    displayName: '离线历史模式',
     provider: 'direct',
-    dataSource: 'online',
-    cameraConnection: 'headless-cpp',
+    dataSource: 'history-local',
+    cameraConnection: 'none',
     cameraCount: 8,
+    acquisitionMode: 'offline',
     cameras: Array.from({ length: 8 }, (_, index) => ({
       id: `C${index + 1}`,
       displayOrder: index + 1,
@@ -272,10 +300,10 @@ function createDisconnectedRuntimeProfile(): PublicRuntimeProfile {
     })),
     configHash: 'disconnected-fallback',
     capabilities: {
-      directCamera: true,
-      captureManagement: true,
-      reconstruction: true,
-      offlineReplay: false,
+      directCamera: false,
+      captureManagement: false,
+      reconstruction: false,
+      offlineReplay: true,
     },
   };
 }
@@ -828,7 +856,7 @@ function InspectionDashboard({
   const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>('theme');
   const [bkvConversionStatusOpen, setBkvConversionStatusOpen] = useState(false);
   const [inspectionFlowVisible, setInspectionFlowVisible] = useState(false);
-  const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>(terminalMode === 'bkv' ? 'history' : 'latest');
+  const [snapshotTracking, setSnapshotTracking] = useState<'latest' | 'history'>(dashboardMode.acquisitionDisabled ? 'history' : 'latest');
   const [snapshotSyncState, setSnapshotSyncState] = useState('等待实时同步');
   const [captureSnapshot, setCaptureSnapshot] = useState(() => createEmptyCaptureSnapshot('capture service pending'));
   const [recordBoundSurface, setRecordBoundSurface] = useState<RecordBoundSurfaceArtifact>({
@@ -910,7 +938,7 @@ function InspectionDashboard({
     fetchConnectionConfig(controller.signal)
       .then((config) => {
         setConnectionDraft(config);
-        setConnectionStatus(config.mode === 'online' ? '在线配置已加载' : '演示模式已加载');
+        setConnectionStatus(`${connectionModeLabel(config.mode)}已加载`);
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
@@ -986,7 +1014,7 @@ function InspectionDashboard({
   }, [settingsModalOpen]);
 
   useEffect(() => {
-    if (!dashboardMode.requestsOnlineServices) return;
+    if (!dashboardMode.allowsAcquisitionWrites) return;
     let cancelled = false;
     const refreshCapture = async () => {
       try {
@@ -1010,10 +1038,11 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [dashboardMode.requestsOnlineServices]);
+  }, [dashboardMode.allowsAcquisitionWrites]);
 
   useEffect(() => {
-    const continuouslyRefreshSnapshot = dashboardMode.requestsOnlineServices;
+    const continuouslyRefreshSnapshot = dashboardMode.requestsOnlineServices
+      && !dashboardMode.requestsStandardRecords;
     if (!continuouslyRefreshSnapshot) return;
     let cancelled = false;
     let inFlight = false;
@@ -1204,6 +1233,22 @@ function InspectionDashboard({
         }
       }
 
+      if (dashboardMode.acquisitionMode !== 'online') {
+        setTriggerGatewayStatus(null);
+        setServiceStatus((current) => ({
+          ...current,
+          triggerGateway: {
+            ...current.triggerGateway,
+            state: 'online',
+            detail: dashboardMode.acquisitionMode === 'simulation'
+              ? '模拟回放不使用物理触发网关'
+              : '离线历史模式不使用物理触发网关',
+          },
+        }));
+        inFlight = false;
+        return;
+      }
+
       try {
         const triggerStatus = await fetchTriggerGatewayStatus();
         if (cancelled) {
@@ -1260,7 +1305,7 @@ function InspectionDashboard({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [dashboardMode.requestsOnlineServices]);
+  }, [dashboardMode.acquisitionMode, dashboardMode.requestsOnlineServices]);
 
   const activeSnapshot = useMemo(() => getPlateInspectionSnapshot(snapshot, uiState.selectedRecordId), [snapshot, uiState.selectedRecordId]);
   const activeInspection = useMemo(
@@ -1933,10 +1978,10 @@ function InspectionDashboard({
       onSnapshotChange(nextSnapshot);
       setUiState(createInitialUiState(nextSnapshot));
       const successMessage = normalizedConnection.mode === 'online'
-        ? `连接成功 · ${normalizedConnection.host}:${normalizedConnection.port}`
-        : '演示模式已保存';
+        ? `${connectionModeLabel('online')}已保存 · ${normalizedConnection.host}:${normalizedConnection.port}`
+        : `${connectionModeLabel('demo')}已保存`;
       setConnectionStatus(successMessage);
-      setToast(normalizedConnection.mode === 'online' ? '连接已保存并刷新服务端数据' : '已切换到本地演示数据');
+      setToast(normalizedConnection.mode === 'online' ? '在线 API 连接已保存并刷新服务端数据' : '已切换到开发用本地假数据（非采集模拟）');
     } catch (error) {
       setConnectionStatus(error instanceof Error ? `连接保存失败：${error.message}` : '连接设置保存失败');
       setToast('连接设置保存失败');
@@ -2001,24 +2046,49 @@ function InspectionDashboard({
   const handleSystemAction = async (action: SystemAction) => {
     if (action === 'self-check') {
       setToast('系统自检中');
-      const [inspectionResult, captureResult, triggerResult] = await Promise.allSettled([
-        fetchInspectionSnapshot(),
-        readCaptureSnapshot(),
-        fetchTriggerGatewayStatus(),
-      ]);
-      if (inspectionResult.status === 'fulfilled') {
-        onSnapshotChange(inspectionResult.value);
+      const plan = getSystemSelfCheckPlan(dashboardMode.acquisitionMode);
+      let checkedInspectionSnapshot: InspectionSnapshot | null = null;
+      let checkedCaptureSnapshot: Awaited<ReturnType<typeof readCaptureSnapshot>> | null = null;
+      const results = await Promise.allSettled(plan.targets.map(async (target) => {
+        if (target === 'inspection') {
+          checkedInspectionSnapshot = await fetchInspectionSnapshot();
+          return;
+        }
+        if (target === 'capture') {
+          checkedCaptureSnapshot = await readCaptureSnapshot();
+          return;
+        }
+        if (target === 'trigger') {
+          await fetchTriggerGatewayStatus();
+          return;
+        }
+        if (target === 'simulation') {
+          const simulationStatus = await readCaptureSimulationStatus();
+          if (!simulationStatus.sourceAvailable) {
+            throw new Error(simulationStatus.lastError || '模拟数据源不可用');
+          }
+          return;
+        }
+        const health = await fetchServiceHealthDetails();
+        const unavailableProcessingCheck = [health.checks.taskWorker, health.checks.algorithm]
+          .find((check) => check && check.ok === false && check.required !== false);
+        if (unavailableProcessingCheck) {
+          throw new Error(unavailableProcessingCheck.reason || '模拟处理链不可用');
+        }
+      }));
+      if (checkedInspectionSnapshot) {
+        onSnapshotChange(checkedInspectionSnapshot);
       }
-      if (captureResult.status === 'fulfilled') {
-        setCaptureSnapshot(captureResult.value);
+      if (checkedCaptureSnapshot) {
+        setCaptureSnapshot(checkedCaptureSnapshot);
       }
-      const failures = [inspectionResult, captureResult, triggerResult].filter((result) => result.status === 'rejected').length;
+      const failures = results.filter((result) => result.status === 'rejected').length;
       if (failures > 0) {
         setToast(`系统自检发现 ${failures} 项服务不可用，请查看顶部服务状态`);
         return;
       }
       setOperationState((current) => runSystemAction(current, action));
-      setToast('系统自检已完成，Rust、采集和触发服务均可达');
+      setToast(plan.successMessage);
       return;
     }
     setOperationState((current) => {
@@ -2050,11 +2120,13 @@ function InspectionDashboard({
             operation={operationState}
             capture={captureSnapshot}
             expectedCameraCount={runtimeProfile.cameraCount}
+            acquisitionMode={dashboardMode.acquisitionMode}
+            simulationConfig={runtimeProfile.simulation}
             onAction={handleSystemAction}
             className="standalone-capture-manager"
           />
         </main>
-        <InspectionFlowTool onSnapshot={onSnapshotChange} />
+        {dashboardMode.usesPhysicalHardware ? <InspectionFlowTool onSnapshot={onSnapshotChange} /> : null}
       </div>
     );
   }
@@ -2116,7 +2188,9 @@ function InspectionDashboard({
           {uiState.activeNav === 'diameter' || onlineWorkspaceMode === 'inspection' ? (
         <div className={`online-workspace ${terminalMode === 'bkv' ? 'runtime-bkv-workspace' : ''}`}>
           <LeftSidebar
-            runtimeMode={terminalMode}
+            runtimeMode={dashboardMode.acquisitionMode}
+            bkvSource={dashboardMode.kind === 'bkv' || dashboardMode.kind === 'bkv-online'}
+            legacyBkv={dashboardMode.kind === 'bkv' && dashboardMode.readOnly}
             plate={activeSnapshot.currentPlate}
             summary={activeSummary}
             activeRecordStatus={activeRecordStatus}
@@ -2168,7 +2242,7 @@ function InspectionDashboard({
                 defectGroups={activeSnapshot.defectGroups}
                 comparison={activeSnapshot.comparison}
                 onSelectDefect={selectDefectById}
-                onReviewDefect={reviewDefect}
+                onReviewDefect={dashboardMode.readOnly ? undefined : reviewDefect}
               />
             ) : (
             <main className={`dashboard-grid online-dashboard-grid ${rightSidebarCollapsed || !hasCurrentDefects ? 'right-sidebar-collapsed' : ''}`}>
@@ -2206,11 +2280,14 @@ function InspectionDashboard({
                   integratedToolbar
                   toolbarExtra={
                     <>
-                      {terminalMode === 'bkv' ? (
-                        <div className="snapshot-follow-summary bkv-record-summary" aria-label="BKV 检测数据状态">
+                      {dashboardMode.acquisitionDisabled ? (
+                        <div className="snapshot-follow-summary bkv-record-summary" aria-label="离线检测数据状态">
                           <i className="history" />
-                          <strong>BKV 离线记录</strong>
-                          <span>流水号 {activeInspection?.inspectionId ?? '--'} · 批次 {bkvRecords?.batchId ?? '--'}</span>
+                          <strong>{dashboardMode.kind === 'bkv' ? 'BKV 离线记录' : '离线历史记录'}</strong>
+                          <span>
+                            流水号 {activeInspection?.inspectionId ?? '--'}
+                            {dashboardMode.kind === 'bkv' ? ` · 批次 ${bkvRecords?.batchId ?? '--'}` : ' · 采集已禁用'}
+                          </span>
                         </div>
                       ) : (
                         <>
@@ -2288,7 +2365,7 @@ function InspectionDashboard({
                   inspectionId={activeInspection?.inspectionId}
                   defect={selectedOnlineDefect}
                   onSidebarCollapse={() => setRightSidebarCollapsed(true)}
-                  onReviewDefect={reviewDefect}
+                  onReviewDefect={dashboardMode.readOnly ? undefined : reviewDefect}
                 />
                 <DefectFilterPanel
                   summary={activeSummary}
@@ -2330,6 +2407,7 @@ function InspectionDashboard({
               statuses={captureSnapshot.statuses}
               health={captureSnapshot.health}
               error={captureSnapshot.error}
+              simulation={dashboardMode.acquisitionMode === 'simulation'}
             />
           )}
         </div>
@@ -2369,7 +2447,7 @@ function InspectionDashboard({
                 downloadTextFile(`${reportMetadata.reportId}.json`, exportReportAsJson(reportMetadata, reportRows), 'application/json;charset=utf-8');
                 setToast('缺陷报表 JSON 已导出');
               }}
-              issueArchiveDisabled={reportMetadata.inspectionIds.length !== 1}
+              issueArchiveDisabled={dashboardMode.readOnly || reportMetadata.inspectionIds.length !== 1}
               printArchiveDisabled={reportMetadata.inspectionIds.length !== 1 || reportArchives.length === 0}
               archiveReports={reportArchives}
               archiveStatus={reportArchiveStatus}
@@ -2390,6 +2468,10 @@ function InspectionDashboard({
                   .catch((error: unknown) => setToast(error instanceof Error ? error.message : '归档打印版生成失败'));
               }}
               onIssueArchive={() => {
+                if (dashboardMode.readOnly) {
+                  setToast('当前运行配置为只读，不能签发新的归档报告');
+                  return;
+                }
                 const inspectionId = reportMetadata.inspectionIds[0];
                 if (!inspectionId || reportMetadata.inspectionIds.length !== 1) {
                   setToast('请选择单个生产检测记录后再签发归档报告');
@@ -2417,6 +2499,8 @@ function InspectionDashboard({
               status={deviceStatus}
               operation={operationState}
               capture={captureSnapshot}
+              acquisitionMode={dashboardMode.acquisitionMode}
+              simulationConfig={runtimeProfile.simulation}
               capabilities={runtimeProfile.capabilities}
               cameraCount={runtimeProfile.cameraCount}
               onAction={handleSystemAction}
@@ -2438,7 +2522,9 @@ function InspectionDashboard({
           bkv: { available: dashboardMode.kind === 'bkv', active: dashboardMode.kind === 'bkv' },
         }}
         flowVisible={inspectionFlowVisible}
-        onFlowToggle={() => setInspectionFlowVisible((current) => !current)}
+        onFlowToggle={dashboardMode.usesPhysicalHardware
+          ? () => setInspectionFlowVisible((current) => !current)
+          : undefined}
         onlineWorkspace={uiState.activeNav === 'online' && dashboardMode.showsCaptureManagement ? {
           mode: onlineWorkspaceMode,
           onToggle: () => setOnlineWorkspaceMode((current) => current === 'inspection' ? 'camera' : 'inspection'),
@@ -2515,11 +2601,13 @@ function InspectionDashboard({
           </section>
         </div>
       ) : null}
-      <InspectionFlowTool
-        visible={inspectionFlowVisible}
-        onVisibleChange={setInspectionFlowVisible}
-        onSnapshot={onSnapshotChange}
-      />
+      {dashboardMode.usesPhysicalHardware ? (
+        <InspectionFlowTool
+          visible={inspectionFlowVisible}
+          onVisibleChange={setInspectionFlowVisible}
+          onSnapshot={onSnapshotChange}
+        />
+      ) : null}
     </div>
   );
 }

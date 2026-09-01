@@ -11,6 +11,8 @@
       "portEnv": "INSPECTION_SERVICE_PORT",
       "healthPath": "/api/health/live",
       "required": true,
+      "enabledWhenModes": ["online", "offline", "simulation"],
+      "requiredWhenModes": ["online", "offline", "simulation"],
       "lifecycle": "service",
       "logFiles": ["inspection-service-*.out.log", "inspection-service-*.err.log"],
       "process": {
@@ -47,6 +49,8 @@
       "portEnv": "STEEL_IMAGE_SERVICE_PORT",
       "healthPath": "/api/health/live",
       "required": true,
+      "enabledWhenModes": ["online", "offline", "simulation"],
+      "requiredWhenModes": ["online", "offline", "simulation"],
       "lifecycle": "health-probe",
       "logFiles": ["image-service*.log"],
       "process": {
@@ -74,6 +78,8 @@
       "healthPath": "/api/health/live",
       "required": true,
       "requiredWhen": "non-bkv",
+      "enabledWhenModes": ["online", "simulation"],
+      "requiredWhenModes": ["online", "simulation"],
       "lifecycle": "health-probe",
       "logFiles": ["image-worker*.log"],
       "process": {
@@ -104,6 +110,8 @@
       "healthPath": "/api/health/live",
       "required": true,
       "requiredWhen": "non-bkv",
+      "enabledWhenModes": ["online", "simulation"],
+      "requiredWhenModes": ["online", "simulation"],
       "lifecycle": "health-probe",
       "logFiles": ["defect-worker*.log"],
       "process": {
@@ -134,6 +142,8 @@
       "healthPath": "/health",
       "required": true,
       "requiredWhen": "non-bkv",
+      "enabledWhenModes": ["online", "simulation"],
+      "requiredWhenModes": ["online", "simulation"],
       "lifecycle": "capture-supervisor",
       "logFiles": ["capture-child.log", "sick-capture*.log"],
       "process": {
@@ -143,6 +153,8 @@
           "{workspaceRoot}\\scripts\\sick_capture_service.py",
           "--profile",
           "{workspaceRoot}\\config\\sites\\sick-array-6\\capture.json",
+          "--runtime-profile",
+          "{workspaceRoot}\\config\\sites\\sick-array-6\\runtime.json",
           "--host",
           "127.0.0.1",
           "--port",
@@ -166,7 +178,9 @@
       "defaultOrigin": "http://127.0.0.1:4881",
       "originEnv": "TRIGGER_GATEWAY_ORIGIN",
       "healthPath": "/health",
-      "required": false,
+      "required": true,
+      "enabledWhenModes": ["online"],
+      "requiredWhenModes": ["online"],
       "lifecycle": "health-probe",
       "logFiles": ["trigger*.log"],
       "process": {
@@ -185,7 +199,7 @@
         },
         "stdoutLog": "trigger.out.log",
         "stderrLog": "trigger.err.log",
-        "startupMode": "manual"
+        "startupMode": "normal"
       }
     }
   ]

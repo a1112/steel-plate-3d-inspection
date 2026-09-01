@@ -12,6 +12,7 @@ use serde_json::{self, json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub mod entities;
@@ -24,9 +25,30 @@ use entities::{
 };
 
 pub const DEVELOPMENT_DEFAULT_ADMIN_PASSWORD: &str = "admin123";
-pub const DATABASE_SCHEMA_VERSION: i64 = 5;
+pub const DATABASE_SCHEMA_VERSION: i64 = 6;
 pub const NON_PRODUCTION_DATABASE_ENGINES: [&str; 3] = ["sqlite", "mysql", "postgres"];
 pub const PRODUCTION_DATABASE_ENGINES: [&str; 2] = ["sqlite", "mysql"];
+
+static RUNTIME_SOURCE_MODE: OnceLock<String> = OnceLock::new();
+
+/// Set once during process startup. Runtime acquisition mode changes require
+/// a service restart, so newly persisted inspection rows can safely inherit a
+/// stable source mode without threading it through every task payload.
+pub fn set_runtime_source_mode(mode: &str) {
+    let source_mode = match mode.trim().to_ascii_lowercase().as_str() {
+        "online" => "online",
+        "simulation" => "simulation",
+        _ => "legacy_unknown",
+    };
+    let _ = RUNTIME_SOURCE_MODE.set(source_mode.to_string());
+}
+
+fn runtime_source_mode() -> &'static str {
+    RUNTIME_SOURCE_MODE
+        .get()
+        .map(String::as_str)
+        .unwrap_or("legacy_unknown")
+}
 
 fn production_security_policy_enabled() -> bool {
     if cfg!(test) {
@@ -385,10 +407,12 @@ pub struct AdminDatabaseMetrics {
     pub secondary_data_count: u64,
     pub trigger_event_count: u64,
     pub production_inspection_count: u64,
+    pub production_eligible_inspection_count: u64,
     pub production_task_count: u64,
     pub calibration_operation_count: u64,
     pub capture_file_count: u64,
     pub production_defect_count: u64,
+    pub production_eligible_defect_count: u64,
     pub production_alarm_count: u64,
 }
 
@@ -1297,6 +1321,24 @@ pub async fn load_snapshot(connection: &DatabaseConnection) -> Result<DatabaseSn
     })
 }
 
+async fn count_production_eligible_defects(connection: &DatabaseConnection) -> Result<u64, DbErr> {
+    let Some(row) = connection
+        .query_one(Statement::from_string(
+            connection.get_database_backend(),
+            "SELECT COUNT(*) AS count FROM production_defect AS defect \
+             INNER JOIN production_inspection AS inspection \
+             ON inspection.id = defect.inspection_id \
+             WHERE inspection.production_eligible = TRUE"
+                .to_string(),
+        ))
+        .await?
+    else {
+        return Ok(0);
+    };
+    let count: i64 = row.try_get("", "count")?;
+    Ok(count.max(0) as u64)
+}
+
 pub async fn load_admin_overview(connection: &DatabaseConnection) -> Result<AdminOverview, DbErr> {
     Ok(AdminOverview {
         metrics: AdminDatabaseMetrics {
@@ -1316,12 +1358,17 @@ pub async fn load_admin_overview(connection: &DatabaseConnection) -> Result<Admi
             production_inspection_count: production_inspection::Entity::find()
                 .count(connection)
                 .await?,
+            production_eligible_inspection_count: production_inspection::Entity::find()
+                .filter(production_inspection::Column::ProductionEligible.eq(true))
+                .count(connection)
+                .await?,
             production_task_count: production_task::Entity::find().count(connection).await?,
             calibration_operation_count: calibration_operation::Entity::find()
                 .count(connection)
                 .await?,
             capture_file_count: capture_file::Entity::find().count(connection).await?,
             production_defect_count: production_defect::Entity::find().count(connection).await?,
+            production_eligible_defect_count: count_production_eligible_defects(connection).await?,
             production_alarm_count: production_alarm::Entity::find().count(connection).await?,
         },
         configs: app_config::Entity::find()
@@ -2367,15 +2414,199 @@ pub async fn append_trigger_event(
     .await
 }
 
+#[derive(Clone, Debug)]
+struct ProductionSourceEvidence {
+    source_mode: String,
+    source_mode_explicit: bool,
+    source_dataset_id: String,
+    source_run_id: String,
+    source_session_id: String,
+    source_content_hash: String,
+    replayed: bool,
+    production_eligible: bool,
+}
+
+fn bounded_source_value(value: Option<&str>, maximum: usize) -> String {
+    value
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(maximum)
+        .collect()
+}
+
+fn collect_source_provenance<'a>(value: &'a Value, depth: usize, output: &mut Vec<&'a Value>) {
+    if depth > 8 || output.len() >= 32 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            if let Some(provenance) = object.get("sourceProvenance") {
+                output.push(provenance);
+            }
+            for child in object.values().take(64) {
+                collect_source_provenance(child, depth + 1, output);
+            }
+        }
+        Value::Array(items) => {
+            for child in items.iter().take(32) {
+                collect_source_provenance(child, depth + 1, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn source_string<'a>(values: &[&'a Value], keys: &[&str]) -> Option<&'a str> {
+    values.iter().find_map(|value| {
+        keys.iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn source_bool(values: &[&Value], keys: &[&str]) -> Option<bool> {
+    values.iter().find_map(|value| {
+        keys.iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_bool))
+    })
+}
+
+fn source_acquisition_mode<'a>(values: &[&'a Value]) -> Option<&'a str> {
+    values.iter().find_map(|value| {
+        ["sourceMode", "runtimeMode", "acquisitionMode"]
+            .iter()
+            .filter_map(|key| value.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .find(|mode| {
+                matches!(
+                    mode.to_ascii_lowercase().as_str(),
+                    "online" | "offline" | "simulation"
+                )
+            })
+    })
+}
+
+fn production_source_evidence(raw_payload: &str) -> ProductionSourceEvidence {
+    let payload = serde_json::from_str::<Value>(raw_payload).unwrap_or(Value::Null);
+    let mut values = vec![&payload];
+    collect_source_provenance(&payload, 0, &mut values);
+    let replayed = source_bool(&values, &["replayed"]).unwrap_or(false)
+        || runtime_source_mode() == "simulation";
+    let declared_mode = source_acquisition_mode(&values);
+    let source_mode_explicit = replayed || declared_mode.is_some();
+    let declared_mode = declared_mode
+        .unwrap_or(runtime_source_mode())
+        .to_ascii_lowercase();
+    let source_mode = if replayed || declared_mode == "simulation" {
+        "simulation"
+    } else if declared_mode == "online" {
+        "online"
+    } else {
+        "legacy_unknown"
+    }
+    .to_string();
+    let provenance_values = values.get(1..).unwrap_or_default();
+    let source_dataset_id = source_string(&values, &["sourceDatasetId"])
+        .or_else(|| source_string(provenance_values, &["datasetId"]));
+    let source_run_id = source_string(&values, &["sourceRunId"])
+        .or_else(|| source_string(provenance_values, &["runId"]));
+    let source_content_hash = source_string(&values, &["sourceContentHash"])
+        .or_else(|| source_string(provenance_values, &["contentHash"]));
+    ProductionSourceEvidence {
+        production_eligible: source_mode != "simulation" && !replayed,
+        source_mode,
+        source_mode_explicit,
+        source_dataset_id: bounded_source_value(source_dataset_id, 128),
+        source_run_id: bounded_source_value(source_run_id, 128),
+        source_session_id: bounded_source_value(source_string(&values, &["sourceSessionId"]), 128),
+        source_content_hash: bounded_source_value(source_content_hash, 128),
+        replayed,
+    }
+}
+
+#[cfg(test)]
+mod production_source_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn replay_provenance_is_non_production_and_keeps_stable_source_ids() {
+        let evidence = production_source_evidence(
+            r#"{
+                "sourceProvenance": {
+                    "runtimeMode": "simulation",
+                    "replayed": true,
+                    "datasetId": "dataset-27",
+                    "runId": "run-2",
+                    "sourceSessionId": "source-session",
+                    "contentHash": "abc123"
+                }
+            }"#,
+        );
+        assert_eq!(evidence.source_mode, "simulation");
+        assert_eq!(evidence.source_dataset_id, "dataset-27");
+        assert_eq!(evidence.source_run_id, "run-2");
+        assert_eq!(evidence.source_session_id, "source-session");
+        assert_eq!(evidence.source_content_hash, "abc123");
+        assert!(evidence.replayed);
+        assert!(!evidence.production_eligible);
+    }
+
+    #[test]
+    fn old_rows_remain_explicitly_unknown_instead_of_inheriting_provider_state() {
+        let evidence = production_source_evidence(r#"{"status":"finished"}"#);
+        assert_eq!(evidence.source_mode, runtime_source_mode());
+        assert_eq!(evidence.source_mode, "legacy_unknown");
+        assert!(!evidence.source_mode_explicit);
+        assert!(!evidence.replayed);
+        assert!(evidence.production_eligible);
+    }
+
+    #[test]
+    fn capture_strategy_name_is_not_mistaken_for_an_acquisition_mode() {
+        let evidence = production_source_evidence(
+            r#"{"acquisitionMode":"continuous","captureMode":"continuous"}"#,
+        );
+        assert_eq!(evidence.source_mode, runtime_source_mode());
+        assert!(!evidence.source_mode_explicit);
+    }
+}
+
 pub async fn upsert_production_inspection(
     connection: &DatabaseConnection,
     input: ProductionInspectionInput,
 ) -> Result<production_inspection::Model, DbErr> {
+    let evidence = production_source_evidence(&input.raw_payload);
     let existing = production_inspection::Entity::find()
         .filter(production_inspection::Column::Id.eq(&input.id))
         .one(connection)
         .await?;
     if let Some(model) = existing {
+        let current_source_mode = model.source_mode.clone();
+        let current_source_dataset_id = model.source_dataset_id.clone();
+        let current_source_run_id = model.source_run_id.clone();
+        let current_source_session_id = model.source_session_id.clone();
+        let current_source_content_hash = model.source_content_hash.clone();
+        let current_replayed = model.replayed;
+        let current_production_eligible = model.production_eligible;
+        let protected_provenance = current_replayed || !current_production_eligible;
+        let conflicts = |current: &str, incoming: &str| {
+            !current.is_empty() && !incoming.is_empty() && current != incoming
+        };
+        if protected_provenance
+            && ((evidence.source_mode_explicit
+                && evidence.source_mode != "legacy_unknown"
+                && conflicts(&current_source_mode, &evidence.source_mode))
+                || conflicts(&current_source_dataset_id, &evidence.source_dataset_id)
+                || conflicts(&current_source_run_id, &evidence.source_run_id)
+                || conflicts(&current_source_session_id, &evidence.source_session_id)
+                || conflicts(&current_source_content_hash, &evidence.source_content_hash))
+        {
+            return Err(DbErr::Custom(
+                "production_source_provenance_conflict: replay provenance is immutable".to_string(),
+            ));
+        }
         let mut active: production_inspection::ActiveModel = model.into();
         active.material_id = Set(input.material_id);
         active.session_id = Set(input.session_id);
@@ -2385,6 +2616,56 @@ pub async fn upsert_production_inspection(
         active.finished_at = Set(input.finished_at);
         active.capture_count = Set(input.capture_count);
         active.defect_count = Set(input.defect_count);
+        active.source_mode = Set(
+            if protected_provenance && current_source_mode != "legacy_unknown" {
+                current_source_mode
+            } else if evidence.source_mode == "legacy_unknown"
+                || (!evidence.source_mode_explicit && current_source_mode == "legacy_unknown")
+            {
+                current_source_mode
+            } else {
+                evidence.source_mode.clone()
+            },
+        );
+        active.source_dataset_id = Set(
+            if evidence.source_dataset_id.is_empty()
+                || (protected_provenance && !current_source_dataset_id.is_empty())
+            {
+                current_source_dataset_id
+            } else {
+                evidence.source_dataset_id.clone()
+            },
+        );
+        active.source_run_id = Set(
+            if evidence.source_run_id.is_empty()
+                || (protected_provenance && !current_source_run_id.is_empty())
+            {
+                current_source_run_id
+            } else {
+                evidence.source_run_id.clone()
+            },
+        );
+        active.source_session_id = Set(
+            if evidence.source_session_id.is_empty()
+                || (protected_provenance && !current_source_session_id.is_empty())
+            {
+                current_source_session_id
+            } else {
+                evidence.source_session_id.clone()
+            },
+        );
+        active.source_content_hash = Set(
+            if evidence.source_content_hash.is_empty()
+                || (protected_provenance && !current_source_content_hash.is_empty())
+            {
+                current_source_content_hash
+            } else {
+                evidence.source_content_hash.clone()
+            },
+        );
+        active.replayed = Set(current_replayed || evidence.replayed);
+        active.production_eligible =
+            Set(current_production_eligible && evidence.production_eligible);
         active.raw_payload = Set(input.raw_payload);
         active.update(connection).await
     } else {
@@ -2399,6 +2680,13 @@ pub async fn upsert_production_inspection(
             finished_at: Set(input.finished_at),
             capture_count: Set(input.capture_count),
             defect_count: Set(input.defect_count),
+            source_mode: Set(evidence.source_mode),
+            source_dataset_id: Set(evidence.source_dataset_id),
+            source_run_id: Set(evidence.source_run_id),
+            source_session_id: Set(evidence.source_session_id),
+            source_content_hash: Set(evidence.source_content_hash),
+            replayed: Set(evidence.replayed),
+            production_eligible: Set(evidence.production_eligible),
             raw_payload: Set(input.raw_payload),
         }
         .insert(connection)
@@ -4950,6 +5238,13 @@ pub async fn import_bkv_batch(
             finished_at: Set(material.occurred_at.clone()),
             capture_count: Set(capture_count.min(i32::MAX as usize) as i32),
             defect_count: Set(defect_count.min(i32::MAX as usize) as i32),
+            source_mode: Set("legacy_unknown".to_string()),
+            source_dataset_id: Set(String::new()),
+            source_run_id: Set(String::new()),
+            source_session_id: Set(String::new()),
+            source_content_hash: Set(String::new()),
+            replayed: Set(false),
+            production_eligible: Set(true),
             raw_payload: Set(material.raw_payload.clone()),
         }
         .insert(&transaction)
@@ -5152,6 +5447,78 @@ pub async fn append_config_revision(
     }
     .insert(connection)
     .await
+}
+
+/// Persist the runtime-profile revision and its audit event in one database
+/// transaction. Mode transitions stage the target bytes first and only publish
+/// them after this receipt is durable; a journal-publish failure compensates
+/// both rows with `rollback_runtime_profile_revision_and_audit`.
+#[derive(Clone, Debug)]
+pub struct RuntimeProfileCommitReceipt {
+    pub revision_id: String,
+    pub audit_id: String,
+}
+
+pub async fn append_runtime_profile_revision_and_audit(
+    connection: &DatabaseConnection,
+    value: &str,
+    actor: &str,
+    profile_id: &str,
+) -> Result<RuntimeProfileCommitReceipt, DbErr> {
+    let transaction = connection.begin().await?;
+    let revision = config_revision::ActiveModel {
+        id: Set(format!("CFG-{}", now_nanos_string())),
+        config_key: Set("runtime-profile".to_string()),
+        value: Set(value.to_string()),
+        actor: Set(actor.to_string()),
+        action: Set("save".to_string()),
+        bytes: Set(value.len().min(i32::MAX as usize) as i32),
+        created_at: Set(now_millis_string()),
+    }
+    .insert(&transaction)
+    .await
+    .map_err(|error| DbErr::Custom(format!("runtime_profile_revision_failed: {error}")))?;
+    let audit = audit_log::ActiveModel {
+        id: Set(format!("AUD-{}", now_nanos_string())),
+        actor: Set(actor.to_string()),
+        action: Set("runtime-profile.update".to_string()),
+        target: Set(profile_id.to_string()),
+        detail: Set("保存运行模式配置；服务重启后生效".to_string()),
+        level: Set("warning".to_string()),
+        created_at: Set(now_millis_string()),
+    }
+    .insert(&transaction)
+    .await
+    .map_err(|error| DbErr::Custom(format!("runtime_profile_audit_failed: {error}")))?;
+    transaction.commit().await.map_err(|error| {
+        DbErr::Custom(format!("runtime_profile_metadata_commit_failed: {error}"))
+    })?;
+    Ok(RuntimeProfileCommitReceipt {
+        revision_id: revision.id,
+        audit_id: audit.id,
+    })
+}
+
+pub async fn rollback_runtime_profile_revision_and_audit(
+    connection: &DatabaseConnection,
+    receipt: &RuntimeProfileCommitReceipt,
+) -> Result<(), DbErr> {
+    let transaction = connection.begin().await?;
+    let audit_deleted = audit_log::Entity::delete_by_id(&receipt.audit_id)
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    let revision_deleted = config_revision::Entity::delete_by_id(&receipt.revision_id)
+        .exec(&transaction)
+        .await?
+        .rows_affected;
+    if audit_deleted != 1 || revision_deleted != 1 {
+        transaction.rollback().await?;
+        return Err(DbErr::Custom(
+            "runtime profile metadata compensation lost ownership".to_string(),
+        ));
+    }
+    transaction.commit().await
 }
 
 pub async fn list_config_revisions(
@@ -5661,6 +6028,63 @@ async fn migrate_schema_v4_to_v5(connection: &DatabaseConnection) -> Result<(), 
     .await
 }
 
+async fn migrate_schema_v5_to_v6(connection: &DatabaseConnection) -> Result<(), DbErr> {
+    let migration_id = "v5-to-v6-production-inspection-provenance";
+    let started_at = now_millis_string();
+    let engine = match connection.get_database_backend() {
+        DbBackend::Sqlite => "sqlite",
+        DbBackend::MySql => "mysql",
+        DbBackend::Postgres => "postgres",
+    };
+    execute(
+        connection,
+        &format!(
+            "INSERT INTO steel_schema_migration \
+             (migration_id, from_version, to_version, engine, checksum, release_version, release_commit, transaction_id, state, started_at, applied_at, error) \
+             VALUES ('{migration_id}', 5, 6, '{engine}', 'production-inspection-provenance-v6', '', '', '{migration_id}', 'applying', '{started_at}', '', '')"
+        ),
+    )
+    .await?;
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_state SET dirty = 1, active_migration_id = '{migration_id}', updated_at = '{started_at}' WHERE singleton_id = 1"
+        ),
+    )
+    .await?;
+    for migration in [
+        "ALTER TABLE production_inspection ADD COLUMN source_mode VARCHAR(32) NOT NULL DEFAULT 'legacy_unknown'",
+        "ALTER TABLE production_inspection ADD COLUMN source_dataset_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN source_run_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN source_session_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN source_content_hash VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN replayed BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE production_inspection ADD COLUMN production_eligible BOOLEAN NOT NULL DEFAULT TRUE",
+    ] {
+        execute_compatible_migration(connection, migration).await?;
+    }
+    execute_compatible_migration(
+        connection,
+        "CREATE INDEX idx_production_inspection_source_mode ON production_inspection(source_mode, production_eligible, started_at)",
+    )
+    .await?;
+    let applied_at = now_millis_string();
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_migration SET state = 'applied', applied_at = '{applied_at}' WHERE migration_id = '{migration_id}'"
+        ),
+    )
+    .await?;
+    execute(
+        connection,
+        &format!(
+            "UPDATE steel_schema_state SET current_version = 6, dirty = 0, active_migration_id = '', updated_at = '{applied_at}' WHERE singleton_id = 1"
+        ),
+    )
+    .await
+}
+
 async fn prepare_schema(
     connection: &DatabaseConnection,
     production_policy: bool,
@@ -5683,6 +6107,10 @@ async fn prepare_schema(
         }
         if current_version == 4 && DATABASE_SCHEMA_VERSION >= 5 {
             migrate_schema_v4_to_v5(connection).await?;
+            current_version = 5;
+        }
+        if current_version == 5 && DATABASE_SCHEMA_VERSION >= 6 {
+            migrate_schema_v5_to_v6(connection).await?;
         }
         return validate_schema_ledger(connection).await;
     }
@@ -5850,10 +6278,28 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
             finished_at VARCHAR(64) NOT NULL,
             capture_count INTEGER NOT NULL,
             defect_count INTEGER NOT NULL,
+            source_mode VARCHAR(32) NOT NULL DEFAULT 'legacy_unknown',
+            source_dataset_id VARCHAR(128) NOT NULL DEFAULT '',
+            source_run_id VARCHAR(128) NOT NULL DEFAULT '',
+            source_session_id VARCHAR(128) NOT NULL DEFAULT '',
+            source_content_hash VARCHAR(128) NOT NULL DEFAULT '',
+            replayed BOOLEAN NOT NULL DEFAULT FALSE,
+            production_eligible BOOLEAN NOT NULL DEFAULT TRUE,
             raw_payload TEXT NOT NULL
         )",
     )
     .await?;
+    for migration in [
+        "ALTER TABLE production_inspection ADD COLUMN source_mode VARCHAR(32) NOT NULL DEFAULT 'legacy_unknown'",
+        "ALTER TABLE production_inspection ADD COLUMN source_dataset_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN source_run_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN source_session_id VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN source_content_hash VARCHAR(128) NOT NULL DEFAULT ''",
+        "ALTER TABLE production_inspection ADD COLUMN replayed BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE production_inspection ADD COLUMN production_eligible BOOLEAN NOT NULL DEFAULT TRUE",
+    ] {
+        execute_compatible_migration(connection, migration).await?;
+    }
     execute(
         connection,
         "CREATE TABLE IF NOT EXISTS production_task (
@@ -6119,6 +6565,7 @@ async fn create_schema(connection: &DatabaseConnection) -> Result<(), DbErr> {
         "CREATE INDEX idx_production_inspection_status_started ON production_inspection(status, started_at)",
         "CREATE INDEX idx_production_inspection_material ON production_inspection(material_id)",
         "CREATE INDEX idx_production_inspection_session ON production_inspection(session_id)",
+        "CREATE INDEX idx_production_inspection_source_mode ON production_inspection(source_mode, production_eligible, started_at)",
         "CREATE INDEX idx_production_defect_inspection ON production_defect(inspection_id)",
         "CREATE INDEX idx_production_defect_source ON production_defect(source, source_defect_id)",
         "CREATE INDEX idx_production_defect_review ON production_defect(review_status, updated_at)",
@@ -6931,6 +7378,162 @@ mod steel_flow_tests {
     }
 
     #[test]
+    fn replay_provenance_cannot_be_rewritten_by_a_later_online_upsert() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let input = |raw_payload: String, status: &str| ProductionInspectionInput {
+                id: "INSP-REPLAY-IMMUTABLE".to_string(),
+                material_id: "M-1".to_string(),
+                session_id: "SESSION-1".to_string(),
+                status: status.to_string(),
+                storage_root: "D:/inspection".to_string(),
+                summary_path: String::new(),
+                started_at: "1000".to_string(),
+                finished_at: String::new(),
+                capture_count: 1,
+                defect_count: 0,
+                raw_payload,
+            };
+            let replay = json!({
+                "sourceProvenance": {
+                    "runtimeMode": "simulation",
+                    "replayed": true,
+                    "datasetId": "dataset-a",
+                    "runId": "run-a",
+                    "sourceSessionId": "source-session-a",
+                    "contentHash": "hash-a"
+                }
+            })
+            .to_string();
+            let inserted =
+                upsert_production_inspection(&database.connection, input(replay, "capturing"))
+                    .await
+                    .expect("insert replay inspection");
+            assert_eq!(inserted.source_mode, "simulation");
+            assert!(inserted.replayed);
+            assert!(!inserted.production_eligible);
+
+            let conflicting = json!({
+                "sourceProvenance": {
+                    "runtimeMode": "online",
+                    "datasetId": "dataset-b",
+                    "runId": "run-b",
+                    "sourceSessionId": "source-session-b",
+                    "contentHash": "hash-b"
+                }
+            })
+            .to_string();
+            let error =
+                upsert_production_inspection(&database.connection, input(conflicting, "completed"))
+                    .await
+                    .expect_err("replay provenance rewrite must fail");
+            assert!(error
+                .to_string()
+                .contains("production_source_provenance_conflict"));
+
+            let updated = upsert_production_inspection(
+                &database.connection,
+                input("{}".to_string(), "completed"),
+            )
+            .await
+            .expect("status-only update");
+            assert_eq!(updated.source_mode, "simulation");
+            assert_eq!(updated.source_dataset_id, "dataset-a");
+            assert_eq!(updated.source_run_id, "run-a");
+            assert_eq!(updated.source_session_id, "source-session-a");
+            assert_eq!(updated.source_content_hash, "hash-a");
+            assert!(updated.replayed);
+            assert!(!updated.production_eligible);
+        });
+    }
+
+    #[test]
+    fn acceptance_metrics_exclude_replayed_inspections_and_their_defects() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database =
+                open_database_url("sqlite::memory:".to_string(), PathBuf::from(":memory:"))
+                    .await
+                    .expect("database");
+            let inspection = |id: &str, payload: String| ProductionInspectionInput {
+                id: id.to_string(),
+                material_id: id.to_string(),
+                session_id: format!("SESSION-{id}"),
+                status: "completed".to_string(),
+                storage_root: "D:/inspection".to_string(),
+                summary_path: String::new(),
+                started_at: "1000".to_string(),
+                finished_at: "2000".to_string(),
+                capture_count: 1,
+                defect_count: 1,
+                raw_payload: payload,
+            };
+            upsert_production_inspection(
+                &database.connection,
+                inspection(
+                    "ONLINE",
+                    json!({"sourceProvenance":{"runtimeMode":"online"}}).to_string(),
+                ),
+            )
+            .await
+            .expect("online inspection");
+            upsert_production_inspection(
+                &database.connection,
+                inspection(
+                    "SIMULATION",
+                    json!({
+                        "sourceProvenance": {
+                            "runtimeMode": "simulation",
+                            "replayed": true,
+                            "datasetId": "dataset-a",
+                            "runId": "run-a",
+                            "sourceSessionId": "source-session-a",
+                            "contentHash": "hash-a"
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .expect("simulation inspection");
+            let defect = |inspection_id: &str| ProductionDefectInput {
+                inspection_id: inspection_id.to_string(),
+                material_id: inspection_id.to_string(),
+                camera_id: "C1".to_string(),
+                defect_type: "scratch".to_string(),
+                severity: "minor".to_string(),
+                x_mm: 0.0,
+                y_mm: 0.0,
+                z_mm: 0.0,
+                width_mm: 1.0,
+                height_mm: 1.0,
+                depth_mm: 0.1,
+                confidence: 0.9,
+                geometry_json: "{}".to_string(),
+            };
+            append_production_defect(&database.connection, defect("ONLINE"))
+                .await
+                .expect("online defect");
+            append_production_defect(&database.connection, defect("SIMULATION"))
+                .await
+                .expect("simulation defect");
+
+            let metrics = load_admin_overview(&database.connection)
+                .await
+                .expect("admin overview")
+                .metrics;
+            assert_eq!(metrics.production_inspection_count, 2);
+            assert_eq!(metrics.production_eligible_inspection_count, 1);
+            assert_eq!(metrics.production_defect_count, 2);
+            assert_eq!(metrics.production_eligible_defect_count, 1);
+        });
+    }
+
+    #[test]
     fn steel_flow_and_scoped_image_numbers_are_monotonic_and_idempotent() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
@@ -7148,6 +7751,13 @@ mod steel_flow_tests {
                 finished_at: Set("2000".to_string()),
                 capture_count: Set(2),
                 defect_count: Set(0),
+                source_mode: Set("legacy_unknown".to_string()),
+                source_dataset_id: Set(String::new()),
+                source_run_id: Set(String::new()),
+                source_session_id: Set(String::new()),
+                source_content_hash: Set(String::new()),
+                replayed: Set(false),
+                production_eligible: Set(true),
                 raw_payload: Set("{}".to_string()),
             }
             .insert(&database.connection)
@@ -7299,6 +7909,13 @@ mod steel_flow_tests {
                 finished_at: Set("2000".to_string()),
                 capture_count: Set(0),
                 defect_count: Set(0),
+                source_mode: Set("legacy_unknown".to_string()),
+                source_dataset_id: Set(String::new()),
+                source_run_id: Set(String::new()),
+                source_session_id: Set(String::new()),
+                source_content_hash: Set(String::new()),
+                replayed: Set(false),
+                production_eligible: Set(true),
                 raw_payload: Set("{}".to_string()),
             }
             .insert(&database.connection)
@@ -7382,6 +7999,13 @@ mod steel_flow_tests {
                     finished_at: Set(started_at.to_string()),
                     capture_count: Set(1),
                     defect_count: Set(0),
+                    source_mode: Set("legacy_unknown".to_string()),
+                    source_dataset_id: Set(String::new()),
+                    source_run_id: Set(String::new()),
+                    source_session_id: Set(String::new()),
+                    source_content_hash: Set(String::new()),
+                    replayed: Set(false),
+                    production_eligible: Set(true),
                     raw_payload: Set("{}".to_string()),
                 }
                 .insert(&database.connection)
@@ -7568,6 +8192,64 @@ mod steel_flow_tests {
                 .query_one(Statement::from_string(
                     DbBackend::Sqlite,
                     "SELECT state FROM steel_schema_migration WHERE migration_id = 'v4-to-v5-production-defect-algorithm-revision'".to_string(),
+                ))
+                .await
+                .expect("migration query")
+                .expect("migration row")
+                .try_get::<String>("", "state")
+                .expect("migration state");
+            assert_eq!(migration, "applied");
+        });
+    }
+
+    #[test]
+    fn schema_v5_adds_production_inspection_provenance_columns() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let database = Database::connect("sqlite::memory:")
+                .await
+                .expect("database");
+            create_schema(&database).await.expect("schema");
+            create_schema_ledger(&database).await.expect("ledger");
+            execute(&database, "DROP INDEX idx_production_inspection_source_mode")
+                .await
+                .expect("provenance index");
+            for column in [
+                "source_mode",
+                "source_dataset_id",
+                "source_run_id",
+                "source_session_id",
+                "source_content_hash",
+                "replayed",
+                "production_eligible",
+            ] {
+                execute(
+                    &database,
+                    &format!("ALTER TABLE production_inspection DROP COLUMN {column}"),
+                )
+                .await
+                .expect("drop v6 column");
+            }
+            execute(
+                &database,
+                "UPDATE steel_schema_state SET current_version = 5 WHERE singleton_id = 1",
+            )
+            .await
+            .expect("downgrade fixture");
+
+            assert_eq!(
+                prepare_schema(&database, false).await.unwrap(),
+                DATABASE_SCHEMA_VERSION
+            );
+            let row = production_inspection::Entity::find()
+                .one(&database)
+                .await
+                .expect("query provenance-aware entity");
+            assert!(row.is_none());
+            let migration = database
+                .query_one(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "SELECT state FROM steel_schema_migration WHERE migration_id = 'v5-to-v6-production-inspection-provenance'".to_string(),
                 ))
                 .await
                 .expect("migration query")

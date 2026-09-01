@@ -30,6 +30,10 @@ pub struct ServiceRegistration {
     pub required: bool,
     #[serde(default)]
     pub required_when: Option<String>,
+    #[serde(default)]
+    pub enabled_when_modes: Vec<String>,
+    #[serde(default)]
+    pub required_when_modes: Vec<String>,
     #[serde(default = "default_lifecycle")]
     pub lifecycle: String,
     #[serde(default)]
@@ -163,6 +167,24 @@ impl ServiceRegistration {
         }
     }
 
+    pub fn enabled_for_mode(&self, acquisition_mode: &str) -> bool {
+        self.enabled_when_modes.is_empty()
+            || self
+                .enabled_when_modes
+                .iter()
+                .any(|mode| mode.eq_ignore_ascii_case(acquisition_mode))
+    }
+
+    pub fn required_for_mode(&self, provider: &str, acquisition_mode: &str) -> bool {
+        self.required_for_provider(provider)
+            && self.enabled_for_mode(acquisition_mode)
+            && (self.required_when_modes.is_empty()
+                || self
+                    .required_when_modes
+                    .iter()
+                    .any(|mode| mode.eq_ignore_ascii_case(acquisition_mode)))
+    }
+
     pub fn matches_log_file(&self, name: &str) -> bool {
         self.log_files
             .iter()
@@ -251,6 +273,22 @@ impl ServiceRegistry {
                         service.id
                     ));
                 }
+            }
+            if service
+                .enabled_when_modes
+                .iter()
+                .chain(service.required_when_modes.iter())
+                .any(|mode| {
+                    !matches!(
+                        mode.trim().to_ascii_lowercase().as_str(),
+                        "online" | "offline" | "simulation"
+                    )
+                })
+            {
+                return Err(format!(
+                    "service registry acquisition mode condition is invalid: {}",
+                    service.id
+                ));
             }
             if service.log_files.len() > MAX_LOG_PATTERNS
                 || service.log_files.iter().any(|pattern| {
@@ -377,6 +415,32 @@ mod tests {
             "services":[{"id":"a","name":"a","role":"a","defaultOrigin":"http://127.0.0.1:1","logFiles":["..\\secret.log"]}]
         }"#;
         assert!(ServiceRegistry::from_json(unsafe_log, PathBuf::from("test")).is_err());
+    }
+
+    #[test]
+    fn registry_applies_acquisition_mode_enablement_and_requirement_conditions() {
+        let text = r#"{
+            "schema":"steel.service-registry.v1", "version":1,
+            "services":[{
+              "id":"capture", "name":"capture", "role":"capture", "kind":"capture",
+              "defaultOrigin":"http://127.0.0.1:4317", "required":true,
+              "enabledWhenModes":["online","simulation"],
+              "requiredWhenModes":["online"]
+            }]
+        }"#;
+        let registry =
+            ServiceRegistry::from_json(text, PathBuf::from("test")).expect("mode registry");
+        let service = &registry.services[0];
+
+        assert!(service.enabled_for_mode("online"));
+        assert!(service.required_for_mode("external-api", "online"));
+        assert!(service.enabled_for_mode("simulation"));
+        assert!(!service.required_for_mode("external-api", "simulation"));
+        assert!(!service.enabled_for_mode("offline"));
+        assert!(!service.required_for_mode("external-api", "offline"));
+
+        let invalid = text.replace("\"simulation\"", "\"replay\"");
+        assert!(ServiceRegistry::from_json(&invalid, PathBuf::from("test")).is_err());
     }
 
     #[test]

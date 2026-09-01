@@ -18,6 +18,7 @@ const profile: RuntimeProfileDocument = {
   dataSource: 'converted-local',
   cameraConnection: 'none',
   cameraCount: 6,
+  acquisitionMode: 'offline',
   cameras: Array.from({ length: 6 }, (_, index) => ({
     id: `C${index + 1}`,
     displayOrder: index + 1,
@@ -72,6 +73,8 @@ describe('runtime profile admin API', () => {
         dataSource: 'converted-local',
         cameraConnection: 'none',
         cameraCount: 6,
+        acquisitionMode: 'offline',
+        simulation: { configured: false, speed: 1, loop: false, interSessionGapMs: 1500 },
         cameras: profile.cameras,
         configHash: 'active',
         capabilities: profile.capabilities,
@@ -81,6 +84,7 @@ describe('runtime profile admin API', () => {
     const runtime = await fetchRuntimeProfile();
 
     expect(runtime.cameraCount).toBe(6);
+    expect(runtime.acquisitionMode).toBe('offline');
     expect(runtime.cameras.map((camera) => camera.id)).toEqual(['C1', 'C2', 'C3', 'C4', 'C5', 'C6']);
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:4873/api/runtime-profile',
@@ -101,6 +105,7 @@ describe('runtime profile admin API', () => {
             dataSource: 'converted-local',
             cameraConnection: 'none',
             cameraCount: 6,
+            acquisitionMode: 'offline',
             cameras: profile.cameras,
             configHash: 'active',
             capabilities: profile.capabilities,
@@ -129,6 +134,12 @@ describe('runtime profile admin API', () => {
           activeConfigHash: 'active',
           savedConfigHash: 'saved',
           restartRequired: true,
+          targetAcquisitionMode: 'offline',
+          recoveryRequired: false,
+          modeTransitionAccepted: false,
+          modeTransitionCommitted: true,
+          modeTransitionState: 'committed',
+          transitionId: null,
         }),
       });
 
@@ -139,6 +150,9 @@ describe('runtime profile admin API', () => {
     expect(admin.savedProfile.cameraCount).toBe(6);
     expect(validation.restartRequired).toBe(true);
     expect(saved.saved).toBe(true);
+    expect(saved.modeTransitionAccepted).toBe(false);
+    expect(saved.modeTransitionCommitted).toBe(true);
+    expect(saved.recoveryRequired).toBe(false);
     for (const [, init] of fetchMock.mock.calls) {
       expect(init.headers).toEqual(
         expect.objectContaining({ Authorization: 'Bearer admin-token' }),

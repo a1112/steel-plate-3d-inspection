@@ -38,6 +38,10 @@ class RawFrame:
     trigger_issued_ns: int = 0
     trigger_completed_ns: int = 0
     frame_trigger_mode: str = "free-run"
+    # Immutable source evidence for non-physical acquisition modes. Physical
+    # camera frames leave this empty; replay frames record their original
+    # session/camera/index so downstream storage never presents them as live.
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (

@@ -1,5 +1,6 @@
 import { BellRing, ClipboardList, Gauge, ScanSearch, Ruler, Workflow } from 'lucide-react';
 import type { ElementType, MouseEvent } from 'react';
+import type { AcquisitionMode } from '../lib/acquisition-mode';
 import type { InspectionUiState } from '../state/inspection-ui';
 
 export type NavKey = InspectionUiState['activeNav'];
@@ -18,11 +19,13 @@ export function TopNav({
   onChange,
   onDragMouseDown,
   embedded = false,
+  acquisitionMode = 'online',
 }: {
   active: NavKey;
   onChange: (next: NavKey) => void;
   onDragMouseDown?: (event: MouseEvent<HTMLElement>) => void;
   embedded?: boolean;
+  acquisitionMode?: AcquisitionMode;
 }) {
   const handleMouseDown = (event: MouseEvent<HTMLElement>) => {
     if (embedded) {
@@ -36,10 +39,17 @@ export function TopNav({
     <nav className={`top-nav ${embedded ? 'top-nav-embedded' : ''}`} data-no-drag={embedded || undefined} onMouseDown={handleMouseDown}>
       {navItems.map((item) => {
         const Icon = item.icon;
+        const label = item.id === 'online'
+          ? acquisitionMode === 'offline'
+            ? '历史查看'
+            : acquisitionMode === 'simulation'
+              ? '模拟运行'
+              : item.label
+          : item.label;
         return (
           <button key={item.id} type="button" className={active === item.id ? 'active' : ''} onClick={() => onChange(item.id)}>
             <Icon size={18} />
-            <span>{item.label}</span>
+            <span>{label}</span>
           </button>
         );
       })}

@@ -98,10 +98,12 @@ import {
   type ConnectionConfig,
   type DatabaseInfo,
 } from '../services/inspection-api';
+import { connectionModeLabel } from '../lib/connection-mode';
 import { Panel } from './Panel';
 import { GlobalConfigurationPanel } from './GlobalConfigurationPanel';
 import { RuntimeLogStatusPanel } from './RuntimeLogStatusPanel';
 import { checkSiteConfig } from '../services/site-config-api';
+import { inspectionSourcePresentation } from '../lib/inspection-source';
 
 type JsonToken = {
   value: string;
@@ -1935,7 +1937,7 @@ export function ParameterManagementApp() {
           <dl className="parameter-facts">
             <div>
               <dt>运行模式</dt>
-              <dd>{connection.mode === 'online' ? '在线模式' : '演示模式'}</dd>
+              <dd>{connectionModeLabel(connection.mode)}</dd>
             </div>
             <div>
               <dt>API 服务</dt>
@@ -2309,14 +2311,16 @@ export function ParameterManagementApp() {
                   <th>钢种</th>
                   <th>规格</th>
                   <th>状态</th>
+                  <th>来源</th>
                   <th>缺陷</th>
                   <th>严重 / 复核 / 轻微</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody>
-                {recordRows.map((record) => (
-                  <tr key={record.id}>
+                {recordRows.map((record) => {
+                  const source = inspectionSourcePresentation(record);
+                  return <tr key={record.id}>
                     <td>{record.id}</td>
                     <td>{record.plateNo}</td>
                     <td>{record.plate?.steelGrade ?? '-'}</td>
@@ -2324,6 +2328,7 @@ export function ParameterManagementApp() {
                       {record.plate ? `${record.plate.widthMm} x ${record.plate.lengthMm} x ${record.plate.thicknessMm}mm` : '-'}
                     </td>
                     <td>{record.status === 'detecting' ? '检测中' : '已完成'}</td>
+                    <td><span className={`record-source-badge ${source.tone}`} title={source.title}>{source.label}</span></td>
                     <td>{record.defectCount}</td>
                     <td>{record.severity.severe} / {record.severity.review} / {record.severity.minor}</td>
                     <td>
@@ -2341,8 +2346,8 @@ export function ParameterManagementApp() {
                         )}
                       </div>
                     </td>
-                  </tr>
-                ))}
+                  </tr>;
+                })}
               </tbody>
             </table>
           </div>
@@ -2364,6 +2369,7 @@ export function ParameterManagementApp() {
               <div className="admin-record-detail-head">
                 <strong>{selectedRecordDetail.id} / {selectedRecordDetail.plateNo}</strong>
                 <span>{selectedRecordDetail.plate?.steelGrade ?? '-'} / {selectedRecordDetail.plate ? `${selectedRecordDetail.plate.widthMm} x ${selectedRecordDetail.plate.lengthMm} x ${selectedRecordDetail.plate.thicknessMm}mm` : '-'}</span>
+                <span className={`record-source-badge ${inspectionSourcePresentation(selectedRecordDetail).tone}`} title={inspectionSourcePresentation(selectedRecordDetail).title}>{inspectionSourcePresentation(selectedRecordDetail).label}</span>
                 <b>{selectedRecordDetail.defects.length} 条缺陷</b>
               </div>
               {selectedRecordDetail.algorithmTrace ? (

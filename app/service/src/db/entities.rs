@@ -223,6 +223,13 @@ pub mod production_inspection {
         pub finished_at: String,
         pub capture_count: i32,
         pub defect_count: i32,
+        pub source_mode: String,
+        pub source_dataset_id: String,
+        pub source_run_id: String,
+        pub source_session_id: String,
+        pub source_content_hash: String,
+        pub replayed: bool,
+        pub production_eligible: bool,
         pub raw_payload: String,
     }
 

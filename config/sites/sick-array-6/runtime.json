@@ -1,12 +1,13 @@
 {
   "schema": "steel.runtime-profile.v1",
   "id": "sick-array-6",
-  "displayName": "SICK 六相机 GenTL 实时检测",
+  "displayName": "SICK 六相机数据回放",
+  "acquisitionMode": "simulation",
   "provider": "external-api",
   "dataSource": "online-production",
   "cameraConnection": "headless-cpp",
   "cameraCount": 6,
-  "captureProfile": "capture.json",
+  "captureProfile": "capture.simulation.json",
   "cameras": [
     { "id": "C1", "displayOrder": 1, "sourceCameraId": 1, "role": "sick-405-1", "sourceDirectory": "" },
     { "id": "C2", "displayOrder": 2, "sourceCameraId": 2, "role": "sick-520-2", "sourceDirectory": "" },
@@ -31,9 +32,15 @@
     "autoProcessLatest": true,
     "processor": "sick-flow-event-v2",
     "configPath": "algorithm.json",
-    "outputRoot": "D:\\steel-sick-data\\derived-output",
+    "outputRoot": "H:\\steel-simulation-output-derived",
     "timingLog": "processing-times.jsonl",
     "maxFramesPerCamera": 64
+  },
+  "simulation": {
+    "sourceRoot": "H:\\steel-inspection-sample-50vol-20260831",
+    "speed": 1.0,
+    "loop": false,
+    "interSessionGapMs": 1500
   },
   "capabilities": {
     "directCamera": true,

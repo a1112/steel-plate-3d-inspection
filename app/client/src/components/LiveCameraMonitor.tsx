@@ -63,6 +63,7 @@ interface LiveMonitoringPageProps {
   statuses: CaptureCameraStatus[];
   health?: CaptureHealth | null;
   error?: string | null;
+  simulation?: boolean;
 }
 
 interface StableStreamImageProps {
@@ -266,12 +267,27 @@ function cameraQualityLabel(status: CaptureCameraStatus) {
   return '在线';
 }
 
-export function LiveMonitoringPage({ statuses, health = null, error = null }: LiveMonitoringPageProps) {
+export function LiveMonitoringPage({ statuses, health = null, error = null, simulation = false }: LiveMonitoringPageProps) {
+  const sourceLabel = simulation ? '模拟通道' : '相机';
+  const arrayLabel = simulation ? '模拟通道网格' : '六相机网格';
+  const arrayPlaybackLabel = simulation ? '模拟通道' : '六相机';
   const cameras = useMemo(
     () => statuses.filter((status) => status.enabled !== false),
     [statuses],
   );
-  const connected = cameras.filter((status) => status.connected);
+  const channelReady = (status: CaptureCameraStatus) => (
+    simulation ? status.replayChannelReady === true : status.connected
+  );
+  const readyChannels = cameras.filter(channelReady);
+  const reportedSimulationChannels = health?.provider !== 'bkv'
+    ? health?.simulationChannelCount
+    : undefined;
+  const readyChannelCount = simulation && typeof reportedSimulationChannels === 'number'
+    ? reportedSimulationChannels
+    : readyChannels.length;
+  const expectedChannelCount = simulation && health?.provider !== 'bkv'
+    ? health?.expectedCameras ?? cameras.length
+    : cameras.length;
   const acquiring = cameras.filter((status) => status.continuousAcquiring);
   const qualityAlarms = cameras.filter((status) => status.imageQuality?.alarmActive);
   const qualitySuspects = cameras.filter((status) => status.imageQuality?.status === 'suspect');
@@ -291,7 +307,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
   const [kind, setKind] = useState<PreviewKind>('intensity');
   const [playing, setPlaying] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('等待相机帧');
+  const [message, setMessage] = useState(simulation ? '等待模拟数据帧' : '等待相机帧');
   const [refreshToken, setRefreshToken] = useState(0);
   const [renderedFrames, setRenderedFrames] = useState(0);
   const [renderedAt, setRenderedAt] = useState<number | null>(null);
@@ -314,11 +330,11 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
   const nextStartBatchIdRef = useRef(0);
 
   const streamTopologyKey = cameras
-    .map((status) => `${status.ip}:${status.connected ? 1 : 0}:${status.streamRunning ? 1 : 0}`)
+    .map((status) => `${status.ip}:${channelReady(status) ? 1 : 0}:${status.streamRunning ? 1 : 0}`)
     .join('|');
 
   const selected = cameras.find((status) => status.ip === selectedIp)
-    ?? connected[0]
+    ?? readyChannels[0]
     ?? cameras[0]
     ?? null;
   const selectedIndex = selected ? cameras.findIndex((status) => status.ip === selected.ip) : -1;
@@ -436,8 +452,8 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
   }, []);
 
   useEffect(() => {
-    if (!selectedIp && connected[0]?.ip) setSelectedIp(connected[0].ip);
-  }, [connected, selectedIp]);
+    if (!selectedIp && readyChannels[0]?.ip) setSelectedIp(readyChannels[0].ip);
+  }, [readyChannels, selectedIp]);
 
   useEffect(() => {
     if (monitorMode !== 'live' || !selected?.streamRunning || playing || pausedByUserRef.current) return;
@@ -469,7 +485,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
     const now = Date.now();
     let nextVerificationDelay = Number.POSITIVE_INFINITY;
     const targets = cameras.filter((status) => {
-      if (!status.connected) return false;
+      if (!channelReady(status)) return false;
       if (locallyStoppedStreamIpsRef.current.has(status.ip)) {
         if (status.streamRunning) return false;
         // The status API has now acknowledged our stop.  A subsequent start
@@ -614,20 +630,20 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
     setRenderedFrames(0);
     setRenderedAt(null);
     setPlaying(true);
-    setMessage('正在切换相机…');
+    setMessage(simulation ? '正在切换模拟通道…' : '正在切换相机…');
   };
 
   const stop = async () => {
     if (!selected) return;
     setBusy(true);
     try {
-      const targetIps = focusedIp ? [selected.ip] : connected.map((status) => status.ip);
+      const targetIps = focusedIp ? [selected.ip] : readyChannels.map((status) => status.ip);
       const result = await stopStreams(targetIps);
       pausedByUserRef.current = true;
       setPlaying(false);
       setMessage(result.errors.length > 0
         ? `已暂停 ${result.stopped}/${result.requested} 路；${result.errors.join('；')}`
-        : focusedIp ? `${cameraLabel(selected, selectedIndex)} 实时播放已暂停` : '六相机实时播放已暂停');
+        : focusedIp ? `${cameraLabel(selected, selectedIndex)} 实时播放已暂停` : `${arrayPlaybackLabel}实时播放已暂停`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '停止实时播放失败');
     } finally {
@@ -655,7 +671,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
   const returnToGrid = () => {
     setFocusedIp(null);
     setKind('intensity');
-    setMessage('六相机实时帧已同步');
+    setMessage(`${arrayPlaybackLabel}实时帧已同步`);
   };
 
   const changeMonitorMode = (next: MonitorMode) => {
@@ -667,7 +683,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
-      const targetIps = connected.map((status) => status.ip);
+      const targetIps = readyChannels.map((status) => status.ip);
       void stopStreams(targetIps).catch(() => undefined);
       setPlaying(false);
       return;
@@ -678,18 +694,18 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
   };
 
   return (
-    <main className="live-monitor-page" aria-label="相机监控页面">
+    <main className="live-monitor-page" aria-label={simulation ? '模拟通道监控页面' : '相机监控页面'}>
       <header className="live-monitor-header">
         <div className="live-monitor-title">
-          <h1>相机监控</h1>
-          <div className="live-monitor-mode-tabs" role="tablist" aria-label="相机监控模式">
+          <h1>{simulation ? '模拟通道监控' : '相机监控'}</h1>
+          <div className="live-monitor-mode-tabs" role="tablist" aria-label={`${sourceLabel}监控模式`}>
             <button type="button" role="tab" aria-selected={monitorMode === 'live'} className={monitorMode === 'live' ? 'active' : ''} onClick={() => changeMonitorMode('live')}><Radio size={14} />实时</button>
             <button type="button" role="tab" aria-selected={monitorMode === 'playback'} className={monitorMode === 'playback' ? 'active' : ''} onClick={() => changeMonitorMode('playback')}><HardDrive size={14} />回放</button>
           </div>
         </div>
         {monitorMode === 'live' ? <div className="live-monitor-summary" aria-label="实时采集汇总">
-          <span><i className={connected.length > 0 ? 'online' : ''} />相机在线 <b>{connected.length}/{cameras.length}</b></span>
-          <span><Waves size={14} />连续采集 <b>{acquiring.length}/{cameras.length}</b></span>
+          <span><i className={readyChannelCount > 0 ? 'online' : ''} />{simulation ? '通道运行' : '相机在线'} <b>{readyChannelCount}/{expectedChannelCount}</b></span>
+          <span><Waves size={14} />{simulation ? '模拟回放' : '连续采集'} <b>{acquiring.length}/{cameras.length}</b></span>
           <span
             className={qualityAlarms.length > 0 || qualitySuspects.length > 0 ? 'warning' : ''}
             title={qualityAlarms.map((status, index) => `${cameraLabel(status, index)}：${(status.imageQuality?.reasons ?? []).map(imageQualityReasonLabel).join('、')}`).join('；') || '实时图像质量正常'}
@@ -700,7 +716,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
             ? [
                 synchronization.lastRound?.missingCameras?.length
                   ? `最近轮次缺少：${synchronization.lastRound.missingCameras.join('、')}`
-                  : '最近轮次相机齐全',
+                  : `最近轮次${sourceLabel}齐全`,
                 `窗口完整 ${synchronization.completeRounds}/${synchronization.windowRounds}`,
                 `传输序号间隙 ${recentTransportGaps}`,
               ].join('；')
@@ -714,30 +730,30 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
       </header>
 
       {monitorMode === 'playback' ? (
-        <CapturePlayback statuses={cameras} />
+        <CapturePlayback statuses={cameras} simulation={simulation} />
       ) : <section className={`live-monitor-layout ${focusedIp ? 'focused-mode' : 'grid-mode'}`}>
         {focusedIp ? (
           <>
           <article className="live-monitor-stage">
           <header className="live-monitor-stage-header">
             <div>
-              <strong>{selected ? cameraLabel(selected, selectedIndex) : '未选择相机'}</strong>
-              <span>{selected?.ip ?? '等待采集服务返回相机拓扑'}</span>
+              <strong>{selected ? cameraLabel(selected, selectedIndex) : `未选择${sourceLabel}`}</strong>
+              <span>{selected ? (simulation ? selected.role || '已采集数据回放' : selected.ip) : `等待采集服务返回${sourceLabel}拓扑`}</span>
             </div>
             <div className="live-monitor-actions">
               <button className="live-monitor-grid-return" type="button" onClick={returnToGrid}>
-                <LayoutGrid size={15} />返回六相机网格
+                <LayoutGrid size={15} />返回{arrayLabel}
               </button>
               <div className="live-monitor-modes" role="group" aria-label="实时图像类型">
                 <button type="button" className={kind === 'intensity' ? 'active' : ''} onClick={() => setKind('intensity')}>灰度图</button>
                 <button type="button" className={kind === 'depth' ? 'active' : ''} onClick={() => setKind('depth')}>深度图</button>
               </div>
               {playing ? (
-                <button className="live-monitor-playback" type="button" onClick={() => void stop()} disabled={busy || !selected} aria-label="暂停相机实时播放">
+                <button className="live-monitor-playback" type="button" onClick={() => void stop()} disabled={busy || !selected} aria-label={`暂停${sourceLabel}实时播放`}>
                   <CircleStop size={15} />暂停播放
                 </button>
               ) : (
-                <button className="live-monitor-playback" type="button" onClick={play} disabled={busy || !selected?.connected} aria-label="启动相机实时播放">
+                <button className="live-monitor-playback" type="button" onClick={play} disabled={busy || !selected || !channelReady(selected)} aria-label={`启动${sourceLabel}实时播放`}>
                   {busy ? <RefreshCw size={15} className="spin" /> : <Play size={15} />}开始播放
                 </button>
               )}
@@ -748,7 +764,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
             {selected?.imageQuality?.alarmActive ? (
               <div className="live-monitor-quality-alert" role="alert">
                 <AlertTriangle size={16} />
-                <strong>{cameraQualityLabel(selected)}</strong>
+                <strong>{simulation ? '模拟数据异常' : cameraQualityLabel(selected)}</strong>
                 <span>{(selected.imageQuality.reasons ?? []).map(imageQualityReasonLabel).join('；')}</span>
                 {selected.imageQuality.automaticReconnect?.pending ? <em>正在自动重连</em> : null}
               </div>
@@ -758,22 +774,22 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
                 key={`${selected!.ip}:${kind}`}
                 src={imageUrl}
                 alt={`${cameraLabel(selected!, selectedIndex)} 实时${kind === 'intensity' ? '灰度' : '深度'}图`}
-                title="双击返回六相机网格"
+                title={`双击返回${arrayLabel}`}
                 waitingLabel={`${cameraLabel(selected!, selectedIndex)} 等待首帧`}
                 onDoubleClick={returnToGrid}
                 onFrame={() => handleImageLoad(selected!.ip)}
-                onError={() => setMessage('等待相机有效帧')}
+                onError={() => setMessage(`等待${sourceLabel}有效帧`)}
               />
             ) : (
               <div className="live-monitor-empty">
                 <Camera size={54} />
-                <strong>{selected ? message : '未发现采集相机'}</strong>
-                <span>{selected ? '启动播放后将自动重连采集服务' : '请检查 SICK 采集服务与网络连接'}</span>
+                <strong>{selected ? message : `未发现${sourceLabel}`}</strong>
+                <span>{selected ? '启动播放后将自动重连采集服务' : simulation ? '请检查模拟数据源与采集服务' : '请检查 SICK 采集服务与网络连接'}</span>
               </div>
             )}
             {selected ? (
               <div className="live-monitor-overlay">
-                <span className={streamRunning ? 'running' : ''}><i />{streamRunning ? '实时播放中' : message}</span>
+                <span className={streamRunning ? 'running' : ''}><i />{streamRunning ? (simulation ? '模拟回放中' : '实时播放中') : message}</span>
                 <span>{kind === 'intensity' ? '灰度强度' : '深度高度'}</span>
                 <span>{formatFps(selected.streamFps)} FPS</span>
                 <span>流帧 {selected.streamFrames ?? renderedFrames}</span>
@@ -784,22 +800,23 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
           <footer className="live-monitor-stage-footer">
             <span><Radio size={13} />{message}</span>
             <span>前端最近刷新：{renderedAt ? new Date(renderedAt).toLocaleTimeString('zh-CN', { hour12: false }) : '--:--:--'}</span>
-            <span>相机最近帧：{formatFrameTime(selected?.streamLastFrameAt ?? selected?.lastContinuousFrameAt)}</span>
+            <span>{sourceLabel}最近帧：{formatFrameTime(selected?.streamLastFrameAt ?? selected?.lastContinuousFrameAt)}</span>
             <span><HardDrive size={13} />{selected?.storageRoot || '采集存储根目录由服务端配置'}</span>
           </footer>
         </article>
 
-        <aside className="live-monitor-camera-list" aria-label="实时监测相机">
+        <aside className="live-monitor-camera-list" aria-label={`实时监测${sourceLabel}`}>
           <header>
             <div>
-              <span>CAMERA ARRAY</span>
-              <h2>采集相机</h2>
+              <span>{simulation ? 'SIMULATION CHANNELS' : 'CAMERA ARRAY'}</span>
+              <h2>{simulation ? '模拟通道' : '采集相机'}</h2>
             </div>
-            <b>{connected.length} ONLINE</b>
+            <b>{readyChannelCount} {simulation ? 'RUNNING' : 'ONLINE'}</b>
           </header>
-          <div role="tablist" aria-label="实时监测相机">
+          <div role="tablist" aria-label={`实时监测${sourceLabel}`}>
             {cameras.map((status, index) => {
               const active = status.ip === selected?.ip;
+              const ready = channelReady(status);
               return (
                 <button
                   key={status.ip}
@@ -807,16 +824,16 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
                   role="tab"
                   aria-selected={active}
                   className={active ? 'active' : ''}
-                  disabled={!status.connected}
+                  disabled={!ready}
                   onClick={() => selectCamera(status.ip)}
                 >
                   <span className="live-monitor-camera-index">{String(status.deviceId || index + 1).padStart(2, '0')}</span>
                   <span className="live-monitor-camera-copy">
                     <strong>{cameraLabel(status, index)}</strong>
-                    <small>{status.ip}</small>
+                    <small>{simulation ? status.role || '数据回放' : status.ip}</small>
                   </span>
                   <span className="live-monitor-camera-telemetry">
-                    <b className={status.imageQuality?.alarmActive ? 'warning' : status.connected ? 'online' : ''}>{cameraQualityLabel(status)}</b>
+                    <b className={status.imageQuality?.alarmActive ? 'warning' : ready ? 'online' : ''}>{simulation ? ready ? '运行' : '待机' : cameraQualityLabel(status)}</b>
                     <small>{formatFps(status.continuousFps)} FPS · {status.continuousFrameCount ?? 0} 帧</small>
                   </span>
                 </button>
@@ -826,7 +843,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
           {cameras.length === 0 ? (
             <div className="live-monitor-camera-list-empty">
               {error ? <AlertTriangle size={24} /> : <RefreshCw size={24} className="spin" />}
-              <span>{error ? '采集服务离线' : '正在读取相机拓扑…'}</span>
+              <span>{error ? '采集服务离线' : `正在读取${sourceLabel}拓扑…`}</span>
               {error ? <small title={error}>{error}</small> : null}
             </div>
           ) : null}
@@ -836,23 +853,24 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
           <article className="live-monitor-grid-stage">
             <header className="live-monitor-grid-header">
               <div>
-                <strong>六相机实时画面</strong>
+                <strong>{simulation ? '模拟通道实时画面' : '六相机实时画面'}</strong>
                 <span>双击画面放大</span>
               </div>
               {playing ? (
-                <button className="live-monitor-playback" type="button" onClick={() => void stop()} disabled={busy || !selected} aria-label="暂停六相机实时播放">
+                <button className="live-monitor-playback" type="button" onClick={() => void stop()} disabled={busy || !selected} aria-label={`暂停${arrayPlaybackLabel}实时播放`}>
                   <CircleStop size={15} />暂停全部
                 </button>
               ) : (
-                <button className="live-monitor-playback" type="button" onClick={play} disabled={busy || !selected?.connected} aria-label="启动六相机实时播放">
+                <button className="live-monitor-playback" type="button" onClick={play} disabled={busy || !selected || !channelReady(selected)} aria-label={`启动${arrayPlaybackLabel}实时播放`}>
                   {busy ? <RefreshCw size={15} className="spin" /> : <Play size={15} />}开始播放
                 </button>
               )}
             </header>
-            <div className="live-monitor-camera-grid" aria-label="六相机实时画面网格">
+            <div className="live-monitor-camera-grid" aria-label={simulation ? '模拟通道实时画面网格' : '六相机实时画面网格'}>
               {cameras.map((status, index) => {
                 const label = cameraLabel(status, index);
-                const gridImageUrl = status.connected && playing && canRequestStreamFrame(status)
+                const ready = channelReady(status);
+                const gridImageUrl = ready && playing && canRequestStreamFrame(status)
                   ? captureStreamImageUrl(
                     status.ip,
                     'intensity-grid',
@@ -862,14 +880,14 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
                 return (
                   <section
                     key={status.ip}
-                    className={`live-monitor-grid-card ${status.connected ? 'online' : 'offline'} ${status.imageQuality?.alarmActive ? 'quality-alarm' : status.imageQuality?.status === 'suspect' ? 'quality-suspect' : ''}`}
+                    className={`live-monitor-grid-card ${ready ? 'online' : 'offline'} ${status.imageQuality?.alarmActive ? 'quality-alarm' : status.imageQuality?.status === 'suspect' ? 'quality-suspect' : ''}`}
                     role="button"
-                    tabIndex={status.connected ? 0 : -1}
+                    tabIndex={ready ? 0 : -1}
                     aria-label={`放大 ${label} 实时画面`}
                     title={`双击放大 ${label}`}
-                    onDoubleClick={() => status.connected && selectCamera(status.ip)}
+                    onDoubleClick={() => ready && selectCamera(status.ip)}
                     onKeyDown={(event) => {
-                      if (status.connected && (event.key === 'Enter' || event.key === ' ')) {
+                      if (ready && (event.key === 'Enter' || event.key === ' ')) {
                         selectCamera(status.ip);
                       }
                     }}
@@ -877,9 +895,9 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
                     <header>
                       <div>
                         <b>{label}</b>
-                        <span>{status.ip}</span>
+                        <span>{simulation ? status.role || '数据回放' : status.ip}</span>
                       </div>
-                      <span className={status.imageQuality?.alarmActive ? 'warning' : status.connected ? 'online' : ''}><i />{cameraQualityLabel(status)}</span>
+                      <span className={status.imageQuality?.alarmActive ? 'warning' : ready ? 'online' : ''}><i />{simulation ? ready ? '运行' : '待机' : cameraQualityLabel(status)}</span>
                     </header>
                     <div className="live-monitor-grid-viewport">
                       {gridImageUrl ? (
@@ -891,14 +909,14 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
                           onError={() => setMessage(`${label} 等待有效帧`)}
                         />
                       ) : (
-                        <div className="live-monitor-grid-empty"><Camera size={28} /><span>{playing ? '等待相机帧' : '实时播放已暂停'}</span></div>
+                        <div className="live-monitor-grid-empty"><Camera size={28} /><span>{playing ? `等待${sourceLabel}帧` : '实时播放已暂停'}</span></div>
                       )}
                       <span className="live-monitor-grid-expand"><Maximize2 size={13} /></span>
                     </div>
                     <footer>
                       <span>{formatFps(status.streamFps ?? status.continuousFps)} FPS</span>
-                      <span>实时流 {status.streamFrames ?? 0} 帧</span>
-                      <span>连续采集 {status.continuousFrameCount ?? 0} 帧</span>
+                      <span>{simulation ? '回放流' : '实时流'} {status.streamFrames ?? 0} 帧</span>
+                      <span>{simulation ? '数据源' : '连续采集'} {status.continuousFrameCount ?? 0} 帧</span>
                       <span>同步偏差 {status.continuousFrameDelta ?? 0}</span>
                     </footer>
                   </section>
@@ -907,7 +925,7 @@ export function LiveMonitoringPage({ statuses, health = null, error = null }: Li
               {cameras.length === 0 ? (
                 <div className="live-monitor-camera-list-empty" role={error ? 'alert' : 'status'}>
                   {error ? <AlertTriangle size={24} /> : <RefreshCw size={24} className="spin" />}
-                  <span>{error ? '采集服务离线，实时画面已清除' : '正在读取相机拓扑…'}</span>
+                  <span>{error ? '采集服务离线，实时画面已清除' : `正在读取${sourceLabel}拓扑…`}</span>
                   {error ? <small title={error}>{error}</small> : null}
                 </div>
               ) : null}

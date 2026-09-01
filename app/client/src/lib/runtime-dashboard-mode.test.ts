@@ -69,6 +69,59 @@ describe('runtime dashboard mode', () => {
     });
   });
 
+  it('disables acquisition and new reconstruction work in direct offline mode without making history business read-only', () => {
+    expect(createRuntimeDashboardMode({
+      ...directProfile,
+      acquisitionMode: 'offline',
+    })).toMatchObject({
+      kind: 'direct',
+      acquisitionMode: 'offline',
+      requestsOnlineServices: true,
+      showsHardwareStatus: false,
+      showsCaptureManagement: false,
+      showsReconstruction: false,
+      acquisitionDisabled: true,
+      allowsAcquisitionWrites: false,
+      readOnly: false,
+      allowsProductionWrites: true,
+    });
+  });
+
+  it('keeps formal BKV offline history business writable while disabling acquisition and new reconstruction', () => {
+    expect(createRuntimeDashboardMode({
+      ...bkvProfile,
+      acquisitionMode: 'offline',
+    })).toMatchObject({
+      kind: 'bkv',
+      acquisitionMode: 'offline',
+      requestsOnlineServices: true,
+      requestsStandardRecords: true,
+      showsCaptureManagement: false,
+      showsReconstruction: false,
+      acquisitionDisabled: true,
+      allowsAcquisitionWrites: false,
+      readOnly: false,
+      allowsProductionWrites: true,
+    });
+  });
+
+  it('keeps simulation acquisition controls separate from physical hardware status', () => {
+    expect(createRuntimeDashboardMode({
+      ...directProfile,
+      acquisitionMode: 'simulation',
+      simulation: { configured: true, speed: 1.5, loop: true, interSessionGapMs: 1500 },
+    })).toMatchObject({
+      kind: 'direct',
+      acquisitionMode: 'simulation',
+      requestsOnlineServices: true,
+      showsHardwareStatus: false,
+      showsCaptureManagement: true,
+      usesPhysicalHardware: false,
+      usesSimulationSource: true,
+      allowsAcquisitionWrites: true,
+    });
+  });
+
   it('keeps BKV online conversion on the live dashboard without hardware controls', () => {
     expect(createRuntimeDashboardMode(bkvOnlineProfile)).toMatchObject({
       kind: 'bkv-online',

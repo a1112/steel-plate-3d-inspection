@@ -3810,7 +3810,7 @@ fn queue_capacity() -> u64 {
         .clamp(1, MAX_QUEUE_CAPACITY)
 }
 
-fn normalize_kind(value: &str) -> Option<&'static str> {
+pub(super) fn normalize_kind(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
         "capture" | "capture-once" | "capture_once" => Some("capture-once"),
         "algorithm" | "algorithm-run" | "algorithm_run" => Some("algorithm-run"),
@@ -4889,6 +4889,11 @@ fn wait_for_work(state: &ServiceState) {
 fn worker_loop(state: Arc<ServiceState>) {
     set_worker_status(&state, true, None, None);
     loop {
+        if state.runtime_config.acquisition_mode == runtime_profile::AcquisitionMode::Offline {
+            set_worker_status(&state, false, None, None);
+            wait_for_work(&state);
+            continue;
+        }
         set_worker_status(&state, true, None, None);
         let claimed = state
             .runtime

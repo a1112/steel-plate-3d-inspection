@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import type { InspectionRecord, InspectionSummary, SteelPlate } from '../data/inspection';
+import type { AcquisitionMode } from '../lib/acquisition-mode';
 import { fetchInspectionWorldMeta } from '../services/inspection-world-api';
 import { emptyRecordSearchFilters, type RecordSearchFilters } from '../state/record-search';
 import { LeftSidebar } from './LeftSidebar';
@@ -20,8 +21,8 @@ const plate: SteelPlate = {
 };
 
 const records: InspectionRecord[] = [
-  { id: 'R-001', time: '19:00', plateNo: '202606131900', status: 'detecting', defectCount: 12 },
-  { id: 'R-002', time: '18:42', plateNo: '202606131858', status: 'completed', defectCount: 8 },
+  { id: 'R-001', time: '19:00', plateNo: '202606131900', status: 'detecting', defectCount: 12, sourceMode: 'simulation', replayed: true, productionEligible: false },
+  { id: 'R-002', time: '18:42', plateNo: '202606131858', status: 'completed', defectCount: 8, sourceMode: 'unknown' },
 ];
 
 const manyRecords: InspectionRecord[] = Array.from({ length: 401 }, (_, index) => ({
@@ -40,13 +41,17 @@ const summary: InspectionSummary = {
 
 function SidebarHarness({
   runtimeMode = 'online',
+  bkvSource = false,
+  legacyBkv = false,
   onRecordSelect = () => undefined,
   large = false,
   selectedPlate = plate,
   activeRecordStatus = 'completed',
   showDiameterSummary = false,
 }: {
-  runtimeMode?: 'online' | 'bkv';
+  runtimeMode?: AcquisitionMode;
+  bkvSource?: boolean;
+  legacyBkv?: boolean;
   onRecordSelect?: (recordId: string) => void;
   large?: boolean;
   selectedPlate?: SteelPlate;
@@ -71,6 +76,8 @@ function SidebarHarness({
   return (
     <LeftSidebar
       runtimeMode={runtimeMode}
+      bkvSource={bkvSource || legacyBkv}
+      legacyBkv={legacyBkv}
       plate={selectedPlate}
       summary={summary}
       activeRecordStatus={activeRecordStatus}
@@ -128,8 +135,10 @@ describe('LeftSidebar', () => {
 
     expect(screen.getByRole('columnheader', { name: '流水号' })).toBeInTheDocument();
     expect(screen.getByRole('columnheader', { name: '板号' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '来源' })).toBeInTheDocument();
     const row = screen.getByText('R-001').closest('tr');
-    expect(row).toHaveTextContent('202606131900R-00119:00检测中检测中');
+    expect(row).toHaveTextContent('模拟回放·不计入生产验收');
+    expect(screen.getByText('历史来源未知')).toBeInTheDocument();
   });
 
   it('places the current diameter summary above the record query title', () => {
@@ -186,7 +195,7 @@ describe('LeftSidebar', () => {
         firstScreenReady: true,
       },
     } as Awaited<ReturnType<typeof fetchInspectionWorldMeta>>);
-    render(<SidebarHarness runtimeMode="bkv" />);
+    render(<SidebarHarness runtimeMode="offline" legacyBkv />);
 
     fireEvent.mouseEnter(screen.getByText('202606131858').closest('tr')!);
 
@@ -230,10 +239,19 @@ describe('LeftSidebar', () => {
   });
 
   it('identifies BKV records as coming from the standard offline store', () => {
-    render(<SidebarHarness runtimeMode="bkv" />);
+    render(<SidebarHarness runtimeMode="offline" legacyBkv />);
 
     expect(screen.getByText('来源：BKV 标准离线仓库')).toBeInTheDocument();
+    expect(screen.getByText('转换后标准数据 · 只读观察')).toBeInTheDocument();
     expect(screen.queryByText('来源：旧 BKV 文件')).not.toBeInTheDocument();
+  });
+
+  it('keeps formal offline BKV history business enabled without calling it legacy read-only', () => {
+    render(<SidebarHarness runtimeMode="offline" bkvSource />);
+
+    expect(screen.getByText('来源：BKV 标准离线仓库')).toBeInTheDocument();
+    expect(screen.getByText('转换后标准数据 · 历史业务可用')).toBeInTheDocument();
+    expect(screen.queryByText('转换后标准数据 · 只读观察')).not.toBeInTheDocument();
   });
 
   it('loads the next record batch automatically when scrolling near the bottom', async () => {

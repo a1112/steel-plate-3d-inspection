@@ -2,6 +2,7 @@
   "schema": "steel.runtime-profile.v1",
   "id": "bkv-sample",
   "displayName": "BKV 六相机提交样例",
+  "acquisitionMode": "offline",
   "provider": "bkv",
   "dataSource": "converted-local",
   "cameraConnection": "none",

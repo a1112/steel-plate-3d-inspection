@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 const RUNTIME_PROFILE_SCHEMA: &str = "steel.runtime-profile.v1";
@@ -16,6 +18,8 @@ struct RuntimeProfileDocument {
     schema: String,
     id: String,
     display_name: String,
+    #[serde(default)]
+    acquisition_mode: Option<AcquisitionMode>,
     provider: String,
     data_source: String,
     camera_connection: String,
@@ -29,6 +33,8 @@ struct RuntimeProfileDocument {
     capture: Option<RuntimeCapture>,
     #[serde(default)]
     algorithm: RuntimeAlgorithm,
+    #[serde(default)]
+    simulation: Option<RuntimeSimulation>,
     capabilities: RuntimeCapabilities,
 }
 
@@ -36,6 +42,8 @@ struct RuntimeProfileDocument {
 #[serde(rename_all = "camelCase")]
 struct CaptureProfileDocument {
     schema: String,
+    #[serde(default)]
+    storage_root: String,
     expected_cameras: usize,
     cameras: Vec<CaptureCamera>,
 }
@@ -46,6 +54,26 @@ struct CaptureCamera {
     camera_index: usize,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default)]
+    storage_root: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OnlineCaptureHardwareDocument {
+    #[serde(default)]
+    driver_mode: String,
+    #[serde(default)]
+    sick: Option<OnlineSickHardwareDocument>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OnlineSickHardwareDocument {
+    #[serde(default)]
+    cti_path: String,
+    #[serde(default)]
+    cti_sha256: String,
 }
 
 fn default_true() -> bool {
@@ -184,6 +212,60 @@ fn default_source_record_limit() -> usize {
     500
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AcquisitionMode {
+    Online,
+    Offline,
+    Simulation,
+}
+
+impl AcquisitionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Simulation => "simulation",
+        }
+    }
+
+    pub fn physical_camera_required(self) -> bool {
+        matches!(self, Self::Online)
+    }
+}
+
+fn default_simulation_speed() -> f64 {
+    1.0
+}
+
+fn default_simulation_inter_session_gap_ms() -> u64 {
+    1_500
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSimulation {
+    #[serde(default)]
+    pub source_root: String,
+    #[serde(default = "default_simulation_speed")]
+    pub speed: f64,
+    #[serde(default, rename = "loop")]
+    pub loop_playback: bool,
+    #[serde(default = "default_simulation_inter_session_gap_ms", alias = "gapMs")]
+    pub inter_session_gap_ms: u64,
+}
+
+impl Default for RuntimeSimulation {
+    fn default() -> Self {
+        Self {
+            source_root: String::new(),
+            speed: default_simulation_speed(),
+            loop_playback: false,
+            inter_session_gap_ms: default_simulation_inter_session_gap_ms(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeCapabilities {
@@ -193,11 +275,32 @@ pub struct RuntimeCapabilities {
     pub offline_replay: bool,
 }
 
+impl RuntimeCapabilities {
+    fn effective_for_mode(&self, mode: AcquisitionMode) -> Self {
+        match mode {
+            AcquisitionMode::Online => self.clone(),
+            AcquisitionMode::Offline => Self {
+                direct_camera: false,
+                capture_management: false,
+                reconstruction: false,
+                offline_replay: self.offline_replay,
+            },
+            AcquisitionMode::Simulation => Self {
+                direct_camera: false,
+                capture_management: self.capture_management,
+                reconstruction: self.reconstruction,
+                offline_replay: true,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCapability {
     DirectCamera,
     CaptureManagement,
     Reconstruction,
+    OfflineReplay,
 }
 
 impl RuntimeCapability {
@@ -206,6 +309,7 @@ impl RuntimeCapability {
             Self::DirectCamera => "directCamera",
             Self::CaptureManagement => "captureManagement",
             Self::Reconstruction => "reconstruction",
+            Self::OfflineReplay => "offlineReplay",
         }
     }
 }
@@ -222,6 +326,7 @@ pub struct RuntimeProfile {
     pub pending_restart: bool,
     pub id: String,
     pub display_name: String,
+    pub acquisition_mode: AcquisitionMode,
     pub provider: String,
     pub data_source: String,
     pub camera_connection: String,
@@ -229,6 +334,7 @@ pub struct RuntimeProfile {
     pub storage: RuntimeStorage,
     pub capture: RuntimeCapture,
     pub algorithm: RuntimeAlgorithm,
+    pub simulation: Option<RuntimeSimulation>,
     pub capabilities: RuntimeCapabilities,
     pub capture_profile: Option<String>,
     pub config_hash: String,
@@ -288,6 +394,7 @@ impl RuntimeProfile {
                 .ok_or_else(|| "runtime profile path has no site directory".to_string())?
         };
         validate_profile(&document, &allowed_root, configuration_root)?;
+        let acquisition_mode = resolved_acquisition_mode(&document);
         if mark_applied {
             ensure_cache_root_writable(&document.storage, &allowed_root)?;
         }
@@ -312,6 +419,8 @@ impl RuntimeProfile {
             let capture_bytes = fs::read(&capture_path)
                 .map_err(|error| format!("capture profile read failed: {error}"))?;
             validate_capture_profile(&document, &capture_bytes)?;
+            validate_online_capture_hardware(&document, &capture_bytes)?;
+            validate_simulation_path_isolation(&document, &capture_bytes, &allowed_root)?;
             hasher.update([0]);
             hasher.update(capture_bytes);
         } else if document.camera_connection == "headless-cpp" {
@@ -348,6 +457,7 @@ impl RuntimeProfile {
                 && (!mark_applied || site_selection_source != SiteSelectionSource::Repository),
             id: document.id,
             display_name: document.display_name,
+            acquisition_mode,
             provider: document.provider,
             data_source: document.data_source,
             camera_connection: document.camera_connection,
@@ -355,6 +465,7 @@ impl RuntimeProfile {
             storage: document.storage,
             capture,
             algorithm: document.algorithm,
+            simulation: document.simulation,
             capabilities: document.capabilities,
             capture_profile: document.capture_profile,
             config_hash: format!("{:x}", hasher.finalize()),
@@ -388,7 +499,24 @@ impl RuntimeProfile {
                 .ok_or_else(|| "runtime profile path has no site directory".to_string())?
         };
         validate_profile(&document, &allowed_root, configuration_root)?;
-        let profile_bytes = serde_json::to_vec_pretty(candidate)
+        let mut normalized_candidate = candidate.clone();
+        if let Some(profile) = normalized_candidate.as_object_mut() {
+            profile.insert(
+                "acquisitionMode".to_string(),
+                json!(resolved_acquisition_mode(&document)),
+            );
+            if let Some(simulation) = document.simulation.as_ref() {
+                if let Some(settings) = profile.get_mut("simulation").and_then(Value::as_object_mut)
+                {
+                    settings.remove("gapMs");
+                    settings.insert(
+                        "interSessionGapMs".to_string(),
+                        json!(simulation.inter_session_gap_ms),
+                    );
+                }
+            }
+        }
+        let profile_bytes = serde_json::to_vec_pretty(&normalized_candidate)
             .map_err(|error| format!("runtime profile serialization failed: {error}"))?;
         let project_bytes = fs::read(&self.project_path)
             .map_err(|error| format!("project config read failed: {error}"))?;
@@ -402,6 +530,8 @@ impl RuntimeProfile {
             let capture_bytes = fs::read(&capture_path)
                 .map_err(|error| format!("capture profile read failed: {error}"))?;
             validate_capture_profile(&document, &capture_bytes)?;
+            validate_online_capture_hardware(&document, &capture_bytes)?;
+            validate_simulation_path_isolation(&document, &capture_bytes, &allowed_root)?;
             hasher.update([0]);
             hasher.update(capture_bytes);
         } else if document.camera_connection == "headless-cpp" {
@@ -421,15 +551,28 @@ impl RuntimeProfile {
         Ok((profile_bytes, format!("{:x}", hasher.finalize())))
     }
 
+    pub fn candidate_acquisition_mode(&self, candidate: &Value) -> Result<AcquisitionMode, String> {
+        let document: RuntimeProfileDocument = serde_json::from_value(candidate.clone())
+            .map_err(|error| format!("runtime profile JSON invalid: {error}"))?;
+        Ok(resolved_acquisition_mode(&document))
+    }
+
     pub fn allows(&self, capability: RuntimeCapability) -> bool {
+        let capabilities = self.capabilities.effective_for_mode(self.acquisition_mode);
         match capability {
-            RuntimeCapability::DirectCamera => self.capabilities.direct_camera,
-            RuntimeCapability::CaptureManagement => self.capabilities.capture_management,
-            RuntimeCapability::Reconstruction => self.capabilities.reconstruction,
+            RuntimeCapability::DirectCamera => capabilities.direct_camera,
+            RuntimeCapability::CaptureManagement => capabilities.capture_management,
+            RuntimeCapability::Reconstruction => capabilities.reconstruction,
+            RuntimeCapability::OfflineReplay => capabilities.offline_replay,
         }
     }
 
+    pub fn effective_capabilities(&self) -> RuntimeCapabilities {
+        self.capabilities.effective_for_mode(self.acquisition_mode)
+    }
+
     pub fn public_value(&self) -> Value {
+        let capabilities = self.effective_capabilities();
         json!({
             "schema": "steel.runtime-profile.public.v1",
             "siteId": self.site_id,
@@ -442,6 +585,7 @@ impl RuntimeProfile {
             "pendingRestart": self.pending_restart,
             "profileId": self.id,
             "displayName": self.display_name,
+            "acquisitionMode": self.acquisition_mode,
             "provider": self.provider,
             "dataSource": self.data_source,
             "cameraConnection": self.camera_connection,
@@ -455,13 +599,25 @@ impl RuntimeProfile {
             "configHash": self.config_hash,
             "capture": self.capture,
             "algorithm": self.algorithm,
-            "capabilities": self.capabilities,
+            "simulation": self.simulation.as_ref().map(|simulation| json!({
+                "configured": !simulation.source_root.trim().is_empty(),
+                "speed": simulation.speed,
+                "loop": simulation.loop_playback,
+                "interSessionGapMs": simulation.inter_session_gap_ms,
+            })),
+            "capabilities": capabilities,
         })
     }
 
     #[cfg(test)]
     pub fn test_profile(provider: &str, camera_count: usize) -> Self {
-        let direct = provider != "bkv";
+        let acquisition_mode = match provider {
+            "bkv" => AcquisitionMode::Offline,
+            "simulated" => AcquisitionMode::Simulation,
+            _ => AcquisitionMode::Online,
+        };
+        let direct = acquisition_mode == AcquisitionMode::Online;
+        let capture_enabled = acquisition_mode != AcquisitionMode::Offline;
         Self {
             site_id: format!("test-{provider}-{camera_count}"),
             site_display_name: "test site".to_string(),
@@ -477,17 +633,19 @@ impl RuntimeProfile {
             pending_restart: false,
             id: format!("test-{provider}-{camera_count}"),
             display_name: "test runtime".to_string(),
+            acquisition_mode,
             provider: provider.to_string(),
             data_source: if provider == "bkv" {
                 "converted-local".to_string()
             } else {
                 "online-production".to_string()
             },
-            camera_connection: if direct {
-                "headless-cpp".to_string()
-            } else {
-                "none".to_string()
-            },
+            camera_connection: match acquisition_mode {
+                AcquisitionMode::Online => "headless-cpp",
+                AcquisitionMode::Offline => "none",
+                AcquisitionMode::Simulation => "simulated",
+            }
+            .to_string(),
             cameras: (1..=camera_count)
                 .map(|camera| RuntimeCamera {
                     id: format!("C{camera}"),
@@ -499,15 +657,21 @@ impl RuntimeProfile {
                 .collect(),
             storage: RuntimeStorage::default(),
             capture: RuntimeCapture {
-                enabled: direct,
-                autostart: direct,
+                enabled: capture_enabled,
+                autostart: capture_enabled,
             },
             algorithm: RuntimeAlgorithm::default(),
+            simulation: (acquisition_mode == AcquisitionMode::Simulation).then(|| {
+                RuntimeSimulation {
+                    source_root: std::env::temp_dir().display().to_string(),
+                    ..RuntimeSimulation::default()
+                }
+            }),
             capabilities: RuntimeCapabilities {
                 direct_camera: direct,
-                capture_management: direct,
-                reconstruction: direct,
-                offline_replay: !direct,
+                capture_management: capture_enabled,
+                reconstruction: capture_enabled,
+                offline_replay: acquisition_mode != AcquisitionMode::Online,
             },
             capture_profile: None,
             config_hash: "test".to_string(),
@@ -598,7 +762,11 @@ fn validate_profile(
         }
     }
 
+    let acquisition_mode = resolved_acquisition_mode(document);
     let capture = resolved_capture(document);
+    if capture.autostart && !capture.enabled {
+        return Err("capture.autostart requires capture.enabled=true".to_string());
+    }
     match document.camera_connection.as_str() {
         "none" => {
             if document.capabilities.direct_camera
@@ -631,11 +799,46 @@ fn validate_profile(
                     "headless-cpp runtime profile requires capture.enabled=true".to_string()
                 );
             }
-            if capture.autostart && !capture.enabled {
-                return Err("capture.autostart requires capture.enabled=true".to_string());
-            }
         }
         other => return Err(format!("unsupported cameraConnection: {other}")),
+    }
+
+    if acquisition_mode == AcquisitionMode::Online
+        && matches!(document.provider.as_str(), "bkv" | "simulated")
+    {
+        return Err("online mode requires a physical capture provider".to_string());
+    }
+    if acquisition_mode == AcquisitionMode::Simulation {
+        if document.camera_count != 6 {
+            return Err("formal simulation mode requires runtime cameraCount=6".to_string());
+        }
+        if document.provider != "external-api"
+            || document.camera_connection != "headless-cpp"
+            || !capture.enabled
+            || !document.capabilities.capture_management
+        {
+            return Err(
+                "simulation mode requires the configured external-api capture pipeline".to_string(),
+            );
+        }
+        let simulation = document
+            .simulation
+            .as_ref()
+            .ok_or_else(|| "simulation mode requires simulation settings".to_string())?;
+        if !is_absolute_non_volume_root(simulation.source_root.trim()) {
+            return Err(
+                "simulation sourceRoot must be an absolute non-volume-root path".to_string(),
+            );
+        }
+        validate_simulation_source_directory(simulation.source_root.trim())?;
+        if !simulation.speed.is_finite() || !(0.25..=4.0).contains(&simulation.speed) {
+            return Err("simulation speed must be between 0.25 and 4.0".to_string());
+        }
+        if !(1_001..=3_600_000).contains(&simulation.inter_session_gap_ms) {
+            return Err(
+                "simulation interSessionGapMs must be between 1001 and 3600000".to_string(),
+            );
+        }
     }
 
     for (value, label) in [
@@ -726,6 +929,22 @@ fn resolved_capture(document: &RuntimeProfileDocument) -> RuntimeCapture {
     })
 }
 
+fn resolved_acquisition_mode(document: &RuntimeProfileDocument) -> AcquisitionMode {
+    document.acquisition_mode.unwrap_or_else(|| {
+        if document.provider.eq_ignore_ascii_case("simulated")
+            || document.camera_connection.eq_ignore_ascii_case("simulated")
+        {
+            AcquisitionMode::Simulation
+        } else if document.provider.eq_ignore_ascii_case("bkv")
+            || document.camera_connection.eq_ignore_ascii_case("none")
+        {
+            AcquisitionMode::Offline
+        } else {
+            AcquisitionMode::Online
+        }
+    })
+}
+
 fn validate_loopback_origin(value: &str) -> Result<(), String> {
     let authority = value
         .strip_prefix("http://")
@@ -761,6 +980,11 @@ fn validate_capture_profile(profile: &RuntimeProfileDocument, bytes: &[u8]) -> R
             CAPTURE_PROFILE_SCHEMAS.join(", ")
         ));
     }
+    if resolved_acquisition_mode(profile) == AcquisitionMode::Simulation
+        && capture.expected_cameras != 6
+    {
+        return Err("formal simulation mode requires capture expectedCameras=6".to_string());
+    }
     let enabled = capture
         .cameras
         .iter()
@@ -774,6 +998,288 @@ fn validate_capture_profile(profile: &RuntimeProfileDocument, bytes: &[u8]) -> R
             .any(|(index, camera)| camera.camera_index != index + 1)
     {
         return Err("capture profile camera topology does not match runtime profile".to_string());
+    }
+    Ok(())
+}
+
+fn validate_online_capture_hardware(
+    profile: &RuntimeProfileDocument,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if resolved_acquisition_mode(profile) != AcquisitionMode::Online {
+        return Ok(());
+    }
+    let capture: OnlineCaptureHardwareDocument = serde_json::from_slice(bytes)
+        .map_err(|error| format!("capture hardware profile JSON invalid: {error}"))?;
+    if !capture
+        .driver_mode
+        .trim()
+        .eq_ignore_ascii_case("sick-gentl")
+    {
+        return Err("online mode requires capture driverMode=sick-gentl".to_string());
+    }
+    let sick = capture
+        .sick
+        .as_ref()
+        .ok_or_else(|| "online mode requires capture sick settings".to_string())?;
+    if sick.cti_path.trim().is_empty() {
+        return Err("online mode requires sick.ctiPath".to_string());
+    }
+    let expected_hash = sick.cti_sha256.trim();
+    if expected_hash.len() != 64 || !expected_hash.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err("sick.ctiSha256 must be a 64-character hexadecimal SHA-256".to_string());
+    }
+    let cti_path = effective_sick_cti_path(&sick.cti_path)?;
+    validate_regular_file_without_links(&cti_path, "sick.ctiPath")?;
+
+    let mut source = fs::File::open(&cti_path).map_err(|error| {
+        format!(
+            "sick.ctiPath could not be opened ({}): {error}",
+            cti_path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).map_err(|error| {
+            format!(
+                "sick.ctiPath could not be hashed ({}): {error}",
+                cti_path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_hash = format!("{:x}", hasher.finalize());
+    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+        return Err(format!(
+            "SICK GenTL producer hash mismatch: expected={} actual={actual_hash}",
+            expected_hash.to_ascii_lowercase()
+        ));
+    }
+    Ok(())
+}
+
+fn effective_sick_cti_path(configured: &str) -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os("SICK_GENTL_CTI").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err("SICK_GENTL_CTI must be an absolute path".to_string());
+        }
+        return Ok(path);
+    }
+
+    let mut expanded = configured.trim().to_string();
+    let mut cursor = 0usize;
+    while let Some(relative_start) = expanded[cursor..].find('%') {
+        let start = cursor + relative_start;
+        let Some(relative_end) = expanded[start + 1..].find('%') else {
+            return Err(
+                "sick.ctiPath contains an unterminated environment placeholder".to_string(),
+            );
+        };
+        let end = start + 1 + relative_end;
+        let name = &expanded[start + 1..end];
+        if name.is_empty() {
+            return Err("sick.ctiPath contains an empty environment placeholder".to_string());
+        }
+        let replacement = env::var(name)
+            .map_err(|_| format!("sick.ctiPath environment variable {name} is unavailable"))?;
+        expanded.replace_range(start..=end, &replacement);
+        cursor = start + replacement.len();
+    }
+    let path = PathBuf::from(expanded);
+    if !path.is_absolute() {
+        return Err("sick.ctiPath must be an absolute path".to_string());
+    }
+    Ok(path)
+}
+
+fn validate_regular_file_without_links(path: &Path, label: &str) -> Result<(), String> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!("{label} must be an unambiguous absolute path"));
+    }
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|error| format!("{label} is unavailable ({}): {error}", ancestor.display()))?;
+        #[cfg(windows)]
+        let linked = {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        };
+        #[cfg(not(windows))]
+        let linked = metadata.file_type().is_symlink();
+        if linked {
+            return Err(format!(
+                "{label} path must not contain links or reparse points"
+            ));
+        }
+        if ancestor == path && !metadata.file_type().is_file() {
+            return Err(format!("{label} must be a regular file"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_simulation_source_directory(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if !path.is_dir() {
+        return Err("simulation sourceRoot must exist and be a directory".to_string());
+    }
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|error| {
+            format!(
+                "simulation sourceRoot metadata is unavailable ({}): {error}",
+                ancestor.display()
+            )
+        })?;
+        #[cfg(windows)]
+        let linked = {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        };
+        #[cfg(not(windows))]
+        let linked = metadata.file_type().is_symlink();
+        if linked {
+            return Err(
+                "simulation sourceRoot path must not contain links or reparse points".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_windows_absolute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || value.starts_with("\\\\")
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    let mut cursor = path.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(&cursor) {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(component) = cursor.file_name().map(|value| value.to_os_string()) else {
+            break;
+        };
+        suffix.push(component);
+        if !cursor.pop() {
+            break;
+        }
+    }
+    path.to_path_buf()
+}
+
+fn resolved_isolation_path(value: &str, base: &Path) -> PathBuf {
+    let path = Path::new(value.trim());
+    if path.is_absolute() {
+        canonicalize_existing_prefix(path)
+    } else if looks_like_windows_absolute(value.trim()) {
+        path.to_path_buf()
+    } else {
+        canonicalize_existing_prefix(&base.join(path))
+    }
+}
+
+fn isolation_path_components(path: &Path) -> Vec<String> {
+    let mut value = path.to_string_lossy().replace('\\', "/");
+    if let Some(stripped) = value.strip_prefix("//?/") {
+        value = stripped.to_string();
+    }
+    let case_insensitive =
+        cfg!(windows) || looks_like_windows_absolute(&value) || value.starts_with("//");
+    let mut components = Vec::new();
+    for component in value.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => {
+                let _ = components.pop();
+            }
+            component => components.push(if case_insensitive {
+                component.to_ascii_lowercase()
+            } else {
+                component.to_string()
+            }),
+        }
+    }
+    components
+}
+
+fn isolation_paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = isolation_path_components(left);
+    let right = isolation_path_components(right);
+    let prefix_matches = |shorter: &[String], longer: &[String]| {
+        shorter.len() <= longer.len()
+            && shorter
+                .iter()
+                .zip(longer.iter())
+                .all(|(left, right)| left == right)
+    };
+    prefix_matches(&left, &right) || prefix_matches(&right, &left)
+}
+
+fn validate_simulation_path_isolation(
+    profile: &RuntimeProfileDocument,
+    capture_bytes: &[u8],
+    allowed_root: &Path,
+) -> Result<(), String> {
+    if resolved_acquisition_mode(profile) != AcquisitionMode::Simulation {
+        return Ok(());
+    }
+    let simulation = profile
+        .simulation
+        .as_ref()
+        .ok_or_else(|| "simulation mode requires simulation settings".to_string())?;
+    let source = resolved_isolation_path(&simulation.source_root, allowed_root);
+    let capture: CaptureProfileDocument = serde_json::from_slice(capture_bytes)
+        .map_err(|error| format!("capture profile JSON invalid: {error}"))?;
+    let mut outputs = Vec::new();
+    if !capture.storage_root.trim().is_empty() {
+        outputs.push(("capture.storageRoot".to_string(), capture.storage_root));
+    }
+    outputs.extend(
+        capture
+            .cameras
+            .into_iter()
+            .filter(|camera| camera.enabled && !camera.storage_root.trim().is_empty())
+            .map(|camera| {
+                (
+                    format!("capture camera {} storageRoot", camera.camera_index),
+                    camera.storage_root,
+                )
+            }),
+    );
+    if !profile.algorithm.output_root.trim().is_empty() {
+        outputs.push((
+            "algorithm.outputRoot".to_string(),
+            profile.algorithm.output_root.clone(),
+        ));
+    }
+    for (label, value) in outputs {
+        let output = resolved_isolation_path(&value, allowed_root);
+        if isolation_paths_overlap(&source, &output) {
+            return Err(format!("simulation sourceRoot must not overlap {label}"));
+        }
     }
     Ok(())
 }
@@ -793,10 +1299,7 @@ fn validate_relative_path(value: &str, label: &str) -> Result<(), String> {
 fn is_absolute_non_volume_root(value: &str) -> bool {
     let path = Path::new(value);
     if path.is_absolute() {
-        return path.parent().is_some()
-            && path
-                .parent()
-                .is_some_and(|parent| parent.parent().is_some());
+        return path.file_name().is_some();
     }
 
     let bytes = value.as_bytes();
@@ -811,7 +1314,7 @@ fn is_absolute_non_volume_root(value: &str) -> bool {
         .split(['\\', '/'])
         .filter(|component| !component.is_empty())
         .count()
-        >= 2
+        >= 1
 }
 
 fn contained_existing_file(
@@ -889,6 +1392,26 @@ mod tests {
         Fixture { root, project }
     }
 
+    fn install_valid_sick_hardware(fixture: &Fixture) -> PathBuf {
+        let cti_path = fixture.root.join("vendor/SICKGigEVisionTL.cti");
+        fs::create_dir_all(cti_path.parent().expect("CTI fixture parent"))
+            .expect("CTI fixture directory");
+        let cti_bytes = b"fixture SICK GenTL producer";
+        fs::write(&cti_path, cti_bytes).expect("CTI fixture");
+        let cti_hash = format!("{:x}", Sha256::digest(cti_bytes));
+        let capture_path = fixture.root.join("capture/profiles/current/profile.json");
+        let mut capture: Value =
+            serde_json::from_slice(&fs::read(&capture_path).expect("capture profile fixture"))
+                .expect("capture profile JSON");
+        capture["driverMode"] = json!("sick-gentl");
+        capture["sick"] = json!({
+            "ctiPath": cti_path.display().to_string(),
+            "ctiSha256": cti_hash,
+        });
+        write_json(&capture_path, &capture);
+        cti_path
+    }
+
     fn cameras(count: usize) -> Vec<Value> {
         (1..=count)
             .map(|camera| {
@@ -929,6 +1452,51 @@ mod tests {
         })
     }
 
+    fn direct_profile(acquisition_mode: &str) -> (Value, Value) {
+        let simulation_root = std::env::temp_dir()
+            .join(format!("steel-simulation-{}", std::process::id()))
+            .join("recorded-dataset");
+        fs::create_dir_all(&simulation_root).expect("simulation source fixture");
+        let simulation_root = simulation_root.display().to_string();
+        let mut profile = json!({
+            "schema": "steel.runtime-profile.v1",
+            "id": "direct-6",
+            "displayName": "六相机直连",
+            "acquisitionMode": acquisition_mode,
+            "provider": "external-api",
+            "dataSource": "online-production",
+            "cameraConnection": "headless-cpp",
+            "cameraCount": 6,
+            "captureProfile": "capture/profiles/current/profile.json",
+            "cameras": cameras(6),
+            "storage": {},
+            "capture": { "enabled": true, "autostart": true },
+            "capabilities": {
+                "directCamera": true,
+                "captureManagement": true,
+                "reconstruction": true,
+                "offlineReplay": true
+            }
+        });
+        if acquisition_mode == "simulation" {
+            profile["simulation"] = json!({
+                "sourceRoot": simulation_root,
+                "speed": 1.0,
+                "loop": true,
+                "interSessionGapMs": 1500
+            });
+        }
+        let capture = json!({
+            "schema": "steel.capture.profile.v1",
+            "expectedCameras": 6,
+            "cameras": (1..=6).map(|camera| json!({
+                "cameraIndex": camera,
+                "enabled": true
+            })).collect::<Vec<_>>()
+        });
+        (profile, capture)
+    }
+
     #[test]
     fn loads_six_camera_bkv_profile_with_non_direct_capabilities() {
         let fixture = fixture(bkv_profile(), None);
@@ -943,6 +1511,356 @@ mod tests {
         assert!(!loaded.capabilities.capture_management);
         assert!(!loaded.capabilities.reconstruction);
         assert!(loaded.capabilities.offline_replay);
+        assert_eq!(loaded.acquisition_mode, AcquisitionMode::Offline);
+        assert!(loaded.allows(RuntimeCapability::OfflineReplay));
+    }
+
+    #[test]
+    fn offline_mode_preserves_physical_configuration_but_exposes_no_capture_capabilities() {
+        let (profile, capture) = direct_profile("offline");
+        let fixture = fixture(profile, Some(capture));
+
+        let loaded = RuntimeProfile::load(&fixture.project, &fixture.root).expect("offline mode");
+
+        assert_eq!(loaded.provider, "external-api");
+        assert_eq!(loaded.camera_connection, "headless-cpp");
+        assert!(loaded.capture.enabled);
+        assert!(!loaded.allows(RuntimeCapability::DirectCamera));
+        assert!(!loaded.allows(RuntimeCapability::CaptureManagement));
+        assert!(!loaded.allows(RuntimeCapability::Reconstruction));
+        assert_eq!(loaded.public_value()["acquisitionMode"], json!("offline"));
+    }
+
+    #[test]
+    fn simulation_mode_keeps_external_provider_and_masks_only_physical_camera_capability() {
+        let (profile, capture) = direct_profile("simulation");
+        let fixture = fixture(profile, Some(capture));
+
+        let loaded =
+            RuntimeProfile::load(&fixture.project, &fixture.root).expect("simulation mode");
+
+        assert_eq!(loaded.provider, "external-api");
+        assert_eq!(loaded.camera_connection, "headless-cpp");
+        assert!(!loaded.allows(RuntimeCapability::DirectCamera));
+        assert!(loaded.allows(RuntimeCapability::CaptureManagement));
+        assert!(loaded.allows(RuntimeCapability::Reconstruction));
+        assert!(loaded.allows(RuntimeCapability::OfflineReplay));
+        assert_eq!(loaded.public_value()["simulation"]["configured"], true);
+        assert_eq!(
+            loaded.public_value()["simulation"]["interSessionGapMs"],
+            json!(1_500)
+        );
+        assert!(loaded.public_value().to_string().contains("\"speed\":1.0"));
+        assert!(!loaded
+            .public_value()
+            .to_string()
+            .contains("recorded-dataset"));
+    }
+
+    #[test]
+    fn formal_simulation_rejects_non_six_channel_runtime_and_capture_topology() {
+        let (mut profile, mut capture) = direct_profile("simulation");
+        profile["cameraCount"] = json!(1);
+        profile["cameras"] = json!([{
+            "id": "C1",
+            "displayOrder": 1,
+            "sourceCameraId": 1,
+            "role": "single-lab"
+        }]);
+        capture["expectedCameras"] = json!(1);
+        capture["cameras"] = json!([{
+            "cameraIndex": 1,
+            "enabled": true
+        }]);
+        let fixture = fixture(profile, Some(capture));
+
+        let error = RuntimeProfile::load(&fixture.project, &fixture.root)
+            .expect_err("single-channel formal simulation must fail");
+        assert!(error.contains("cameraCount=6"), "{error}");
+    }
+
+    #[test]
+    fn offline_and_simulation_never_require_or_access_cti_hardware() {
+        for mode in ["offline", "simulation"] {
+            let (profile, mut capture) = direct_profile(mode);
+            capture["driverMode"] = json!("not-a-camera-driver");
+            capture["sick"] = json!({
+                "ctiPath": "relative/missing/vendor.cti",
+                "ctiSha256": "not-a-hash"
+            });
+            let fixture = fixture(profile, Some(capture));
+            RuntimeProfile::load(&fixture.project, &fixture.root)
+                .unwrap_or_else(|error| panic!("{mode} must not inspect CTI hardware: {error}"));
+        }
+    }
+
+    #[test]
+    fn online_startup_and_candidate_require_verified_sick_cti() {
+        let (profile, capture) = direct_profile("online");
+        let fixture = fixture(profile.clone(), Some(capture));
+        let cti_path = install_valid_sick_hardware(&fixture);
+
+        let mut loaded =
+            RuntimeProfile::load(&fixture.project, &fixture.root).expect("verified online CTI");
+        let candidate_project = fixture.root.join("config/project.json");
+        write_json(
+            &candidate_project,
+            &json!({
+                "schema": "steel.project-config.v1",
+                "activeRuntimeProfile": "runtime-modes/active.json"
+            }),
+        );
+        loaded.project_path = candidate_project;
+        loaded
+            .validate_candidate(&profile)
+            .expect("verified online candidate");
+
+        fs::write(&cti_path, b"tampered producer").expect("tamper CTI fixture");
+        let startup_error = RuntimeProfile::load(&fixture.project, &fixture.root)
+            .expect_err("startup must re-hash CTI");
+        assert!(startup_error.contains("hash mismatch"), "{startup_error}");
+        let candidate_error = loaded
+            .validate_candidate(&profile)
+            .expect_err("candidate must re-hash CTI");
+        assert!(
+            candidate_error.contains("hash mismatch"),
+            "{candidate_error}"
+        );
+    }
+
+    #[test]
+    fn online_rejects_missing_driver_invalid_hash_and_non_file_cti() {
+        let (profile, capture) = direct_profile("online");
+        let fixture = fixture(profile, Some(capture));
+        let cti_path = install_valid_sick_hardware(&fixture);
+        let capture_path = fixture.root.join("capture/profiles/current/profile.json");
+        let mut capture: Value =
+            serde_json::from_slice(&fs::read(&capture_path).expect("capture profile"))
+                .expect("capture JSON");
+
+        capture["driverMode"] = json!("headless-cpp");
+        write_json(&capture_path, &capture);
+        let driver_error = RuntimeProfile::load(&fixture.project, &fixture.root)
+            .expect_err("online driver mismatch");
+        assert!(
+            driver_error.contains("driverMode=sick-gentl"),
+            "{driver_error}"
+        );
+
+        capture["driverMode"] = json!("sick-gentl");
+        capture["sick"]["ctiSha256"] = json!("abc");
+        write_json(&capture_path, &capture);
+        let hash_error =
+            RuntimeProfile::load(&fixture.project, &fixture.root).expect_err("online hash format");
+        assert!(hash_error.contains("64-character"), "{hash_error}");
+
+        capture["sick"]["ctiSha256"] = json!(format!(
+            "{:x}",
+            Sha256::digest(b"fixture SICK GenTL producer")
+        ));
+        fs::remove_file(&cti_path).expect("remove CTI fixture");
+        fs::create_dir(&cti_path).expect("replace CTI with directory");
+        write_json(&capture_path, &capture);
+        let file_error = RuntimeProfile::load(&fixture.project, &fixture.root)
+            .expect_err("CTI directory must fail");
+        assert!(file_error.contains("regular file"), "{file_error}");
+    }
+
+    #[test]
+    fn online_rejects_cti_path_links_or_reparse_points() {
+        let (profile, capture) = direct_profile("online");
+        let fixture = fixture(profile, Some(capture));
+        let cti_path = install_valid_sick_hardware(&fixture);
+        let linked_path = fixture.root.join("vendor/linked.cti");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&cti_path, &linked_path);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&cti_path, &linked_path);
+        #[cfg(not(any(windows, unix)))]
+        let linked: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file links unsupported",
+        ));
+        if linked.is_err() {
+            return;
+        }
+        let capture_path = fixture.root.join("capture/profiles/current/profile.json");
+        let mut capture: Value =
+            serde_json::from_slice(&fs::read(&capture_path).expect("capture profile"))
+                .expect("capture JSON");
+        capture["sick"]["ctiPath"] = json!(linked_path.display().to_string());
+        write_json(&capture_path, &capture);
+
+        let error = RuntimeProfile::load(&fixture.project, &fixture.root)
+            .expect_err("linked CTI must fail");
+        assert!(error.contains("links or reparse points"), "{error}");
+    }
+
+    #[test]
+    fn simulation_mode_rejects_missing_source_and_out_of_range_speed() {
+        let (mut missing, capture) = direct_profile("simulation");
+        missing["simulation"] = Value::Null;
+        let missing_fixture = fixture(missing, Some(capture.clone()));
+        assert!(RuntimeProfile::load(&missing_fixture.project, &missing_fixture.root).is_err());
+
+        let (mut too_fast, _) = direct_profile("simulation");
+        too_fast["simulation"]["speed"] = json!(4.01);
+        let speed_fixture = fixture(too_fast, Some(capture));
+        assert!(RuntimeProfile::load(&speed_fixture.project, &speed_fixture.root).is_err());
+
+        let (mut short_gap, capture) = direct_profile("simulation");
+        short_gap["simulation"]["interSessionGapMs"] = json!(1_000);
+        let gap_fixture = fixture(short_gap, Some(capture));
+        assert!(RuntimeProfile::load(&gap_fixture.project, &gap_fixture.root).is_err());
+
+        let (mut missing_directory, capture) = direct_profile("simulation");
+        missing_directory["simulation"]["sourceRoot"] = json!(std::env::temp_dir()
+            .join(format!(
+                "steel-simulation-missing-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+            .display()
+            .to_string());
+        let missing_directory_fixture = fixture(missing_directory, Some(capture));
+        assert!(RuntimeProfile::load(
+            &missing_directory_fixture.project,
+            &missing_directory_fixture.root
+        )
+        .expect_err("missing simulation source directory")
+        .contains("must exist"));
+    }
+
+    #[test]
+    fn simulation_gap_defaults_above_departure_threshold_and_accepts_legacy_alias() {
+        let (mut default_gap, capture) = direct_profile("simulation");
+        default_gap["simulation"]
+            .as_object_mut()
+            .expect("simulation object")
+            .remove("interSessionGapMs");
+        let default_fixture = fixture(default_gap, Some(capture));
+        let loaded = RuntimeProfile::load(&default_fixture.project, &default_fixture.root)
+            .expect("default simulation gap");
+        assert_eq!(loaded.simulation.unwrap().inter_session_gap_ms, 1_500);
+
+        let (mut alias_gap, capture) = direct_profile("simulation");
+        let simulation = alias_gap["simulation"]
+            .as_object_mut()
+            .expect("simulation object");
+        simulation.remove("interSessionGapMs");
+        simulation.insert("gapMs".to_string(), json!(2_000));
+        let alias_fixture = fixture(alias_gap, Some(capture));
+        let loaded = RuntimeProfile::load(&alias_fixture.project, &alias_fixture.root)
+            .expect("legacy simulation gap alias");
+        assert_eq!(
+            loaded
+                .simulation
+                .as_ref()
+                .expect("simulation settings")
+                .inter_session_gap_ms,
+            2_000
+        );
+    }
+
+    #[test]
+    fn simulation_source_rejects_capture_and_algorithm_output_overlap() {
+        let (profile, mut capture) = direct_profile("simulation");
+        let source = profile["simulation"]["sourceRoot"]
+            .as_str()
+            .expect("simulation source")
+            .to_string();
+        capture["storageRoot"] = json!(Path::new(&source)
+            .parent()
+            .expect("simulation source parent")
+            .display()
+            .to_string());
+        let capture_fixture = fixture(profile, Some(capture));
+        assert!(
+            RuntimeProfile::load(&capture_fixture.project, &capture_fixture.root)
+                .expect_err("capture parent overlap")
+                .contains("capture.storageRoot")
+        );
+
+        let (profile, mut capture) = direct_profile("simulation");
+        let source = profile["simulation"]["sourceRoot"]
+            .as_str()
+            .expect("simulation source")
+            .to_string();
+        capture["cameras"][0]["storageRoot"] =
+            json!(Path::new(&source).join("writer").display().to_string());
+        let camera_fixture = fixture(profile, Some(capture));
+        assert!(
+            RuntimeProfile::load(&camera_fixture.project, &camera_fixture.root)
+                .expect_err("camera child overlap")
+                .contains("capture camera 1 storageRoot")
+        );
+
+        let (mut profile, capture) = direct_profile("simulation");
+        let source = profile["simulation"]["sourceRoot"]
+            .as_str()
+            .expect("simulation source")
+            .to_string();
+        profile["algorithm"] = json!({
+            "enabled": false,
+            "outputRoot": source
+        });
+        let algorithm_fixture = fixture(profile, Some(capture));
+        assert!(
+            RuntimeProfile::load(&algorithm_fixture.project, &algorithm_fixture.root)
+                .expect_err("algorithm exact overlap")
+                .contains("algorithm.outputRoot")
+        );
+    }
+
+    #[test]
+    fn simulation_source_overlap_resolves_existing_directory_links() {
+        let base = std::env::temp_dir().join(format!(
+            "steel-simulation-path-link-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let source = base.join("source");
+        let alias = base.join("alias");
+        fs::create_dir_all(&source).expect("simulation source directory");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&source, &alias);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&source, &alias);
+        #[cfg(not(any(windows, unix)))]
+        let linked: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory links unsupported",
+        ));
+        if linked.is_err() {
+            fs::remove_dir_all(base).ok();
+            return;
+        }
+
+        let (mut profile, mut capture) = direct_profile("simulation");
+        profile["simulation"]["sourceRoot"] = json!(source.display().to_string());
+        capture["storageRoot"] = json!(alias.join("writer").display().to_string());
+        let linked_fixture = fixture(profile, Some(capture));
+        assert!(
+            RuntimeProfile::load(&linked_fixture.project, &linked_fixture.root)
+                .expect_err("linked output overlap")
+                .contains("capture.storageRoot")
+        );
+
+        let (mut linked_source_profile, capture) = direct_profile("simulation");
+        linked_source_profile["simulation"]["sourceRoot"] = json!(alias.display().to_string());
+        let linked_source_fixture = fixture(linked_source_profile, Some(capture));
+        assert!(
+            RuntimeProfile::load(&linked_source_fixture.project, &linked_source_fixture.root)
+                .expect_err("linked simulation source")
+                .contains("links or reparse points")
+        );
+        fs::remove_dir_all(base).expect("remove directory link fixture");
     }
 
     #[test]
@@ -975,6 +1893,7 @@ mod tests {
             })).collect::<Vec<_>>()
         });
         let fixture = fixture(profile, Some(capture));
+        install_valid_sick_hardware(&fixture);
 
         let loaded = RuntimeProfile::load(&fixture.project, &fixture.root).expect("direct profile");
 
@@ -1078,8 +1997,14 @@ mod tests {
             .canonicalize()
             .expect("workspace");
 
-        let loaded = RuntimeProfile::load(&workspace.join("config/project.json"), &workspace)
-            .expect("checked-in runtime");
+        let loaded = match RuntimeProfile::load(&workspace.join("config/project.json"), &workspace)
+        {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                assert!(error.contains("sick.ctiPath"), "{error}");
+                return;
+            }
+        };
 
         assert_eq!(loaded.site_id, "sick-array-6");
         assert_eq!(loaded.site_mode, SiteMode::DirectCamera);
@@ -1090,6 +2015,10 @@ mod tests {
 
     #[test]
     fn recognizes_configured_windows_output_roots_on_every_host_platform() {
+        assert!(is_absolute_non_volume_root(
+            r"H:\steel-inspection-sample-50vol-20260831"
+        ));
+        assert!(!is_absolute_non_volume_root(r"H:\"));
         assert!(is_absolute_non_volume_root(
             r"D:\steel-inspection\algorithm-data"
         ));

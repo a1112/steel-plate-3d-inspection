@@ -145,6 +145,9 @@ const EXTERNAL_INTEGRATIONS_CONFIG_KEY: &str = "external_integrations";
 const DEPTH_GEOMETRY_CONFIG_KEY: &str = "depth_geometry";
 const DEPTH_GEOMETRY_CONFIG_SCHEMA: &str = "steel.sick-depth-geometry-config.v1";
 const CONFIG_JSON_MAX_BYTES: usize = 128 * 1024;
+const RUNTIME_MODE_COMMIT_RELATIVE_PATH: &str = "config/runtime-mode-commit.json";
+const RUNTIME_MODE_TRANSITION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNTIME_MODE_TRANSITION_RELEASE_DELAY: Duration = Duration::from_secs(5);
 const CAPTURE_CAMERA_MAX_COUNT: usize = 16;
 const CAPTURE_SUPERVISOR_POLL_MS: u64 = 500;
 const CAPTURE_READY_TIMEOUT_MS_DEFAULT: u64 = 15_000;
@@ -252,17 +255,48 @@ fn startup_capture_provider(
     requested_provider: Option<&str>,
 ) -> Result<CaptureProvider, String> {
     let configured = CaptureProvider::from_runtime_profile(profile)?;
-    let simulated_requested = requested_provider.is_some_and(|value| {
+    let Some(requested_provider) = requested_provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(configured);
+    };
+    if !matches!(
+        requested_provider.to_ascii_lowercase().as_str(),
+        "headless-cpp"
+            | "external"
+            | "external-api"
+            | "api"
+            | "sim"
+            | "simulated"
+            | "simulation"
+            | "bkv"
+            | "legacy-offline"
+            | "offline-bkv"
+    ) {
+        return Err(format!(
+            "unsupported STEEL_CAPTURE_PROVIDER development override: {requested_provider}"
+        ));
+    }
+    let requested = CaptureProvider::from_env_value(requested_provider);
+    let development_connection = runtime_mode.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "sim" | "simulated" | "simulation"
+            "development" | "dev" | "demo" | "test"
         )
     });
-    if profile.site_mode == site_config::SiteMode::DirectCamera
-        && !runtime_mode.is_some_and(|value| value.trim().eq_ignore_ascii_case("production"))
-        && simulated_requested
+    if development_connection
+        && profile.acquisition_mode == runtime_profile::AcquisitionMode::Online
+        && requested == CaptureProvider::Simulated
     {
         return Ok(CaptureProvider::Simulated);
+    }
+    if requested != configured {
+        return Err(format!(
+            "STEEL_CAPTURE_PROVIDER={} is a development connection override and cannot replace formal acquisitionMode={}",
+            requested.as_str(),
+            profile.acquisition_mode.as_str()
+        ));
     }
     Ok(configured)
 }
@@ -324,6 +358,7 @@ struct ServiceState {
 #[derive(Debug)]
 struct RuntimeAdmissionState {
     accepting: bool,
+    completion_accepting: bool,
     in_flight: u64,
 }
 
@@ -331,6 +366,7 @@ impl Default for RuntimeAdmissionState {
     fn default() -> Self {
         Self {
             accepting: true,
+            completion_accepting: true,
             in_flight: 0,
         }
     }
@@ -403,6 +439,8 @@ struct CaptureServiceManager {
     port: u16,
     origin: String,
     provider: CaptureProvider,
+    acquisition_mode: runtime_profile::AcquisitionMode,
+    simulation: Option<runtime_profile::RuntimeSimulation>,
     process: Mutex<Option<controlled_process::ManagedChild>>,
     lifecycle: Mutex<CaptureLifecycleState>,
     control_allowed: bool,
@@ -1339,11 +1377,62 @@ fn simulated_provider_string_field(payload: &Value, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+fn capture_transition_health_drained(
+    health: &Value,
+    acquisition_mode: runtime_profile::AcquisitionMode,
+) -> bool {
+    let pending_rounds = health
+        .pointer("/storageQueue/pendingRounds")
+        .and_then(Value::as_u64);
+    let active_rounds = health
+        .pointer("/storageQueue/activeRounds")
+        .and_then(Value::as_u64);
+    let pending_commits = health
+        .pointer("/databaseCommit/pendingRounds")
+        .and_then(Value::as_u64);
+    let active_commits = health
+        .pointer("/databaseCommit/activeRounds")
+        .and_then(Value::as_u64);
+    let provider_quiesced = health.get("quiesced").and_then(Value::as_bool) == Some(true);
+    let service_stopped = health
+        .get("serviceState")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("stopped"));
+    if pending_rounds != Some(0)
+        || active_rounds != Some(0)
+        || pending_commits != Some(0)
+        || active_commits != Some(0)
+        || !provider_quiesced
+        || !service_stopped
+    {
+        return false;
+    }
+    match acquisition_mode {
+        runtime_profile::AcquisitionMode::Simulation => {
+            let replay_state = health
+                .pointer("/simulation/state")
+                .or_else(|| health.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            ["paused", "idle", "completed", "stopped"]
+                .iter()
+                .any(|state| replay_state.eq_ignore_ascii_case(state))
+        }
+        runtime_profile::AcquisitionMode::Online => health
+            .get("historyOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        runtime_profile::AcquisitionMode::Offline => true,
+    }
+}
+
 impl CaptureServiceManager {
     fn new(
         port: u16,
         provider: CaptureProvider,
         capture: &runtime_profile::RuntimeCapture,
+        acquisition_mode: runtime_profile::AcquisitionMode,
+        simulation: Option<&runtime_profile::RuntimeSimulation>,
     ) -> Self {
         let origin = capture_origin(port);
         let host = capture_host_from_origin(&origin).unwrap_or_else(|| "127.0.0.1".to_string());
@@ -1354,6 +1443,8 @@ impl CaptureServiceManager {
             port,
             origin,
             provider,
+            acquisition_mode,
+            simulation: simulation.cloned(),
             process: Mutex::new(None),
             lifecycle: Mutex::new(CaptureLifecycleState::with_policy(
                 provider,
@@ -1451,6 +1542,24 @@ impl CaptureServiceManager {
 
     fn supervisor_tick(&self) {
         if self.supervisor_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        if self.acquisition_mode == runtime_profile::AcquisitionMode::Offline {
+            if let Ok(mut process) = self.process.lock() {
+                if let Some(mut child) = process.take() {
+                    let _ = child.terminate();
+                }
+            }
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.phase = "offline";
+                lifecycle.desired_running = false;
+                lifecycle.autostart = false;
+                lifecycle.pid = None;
+                lifecycle.ready_at = None;
+                lifecycle.next_restart_at = None;
+                lifecycle.last_error.clear();
+            }
             return;
         }
 
@@ -1729,6 +1838,14 @@ impl CaptureServiceManager {
     }
 
     fn start(&self) -> bool {
+        if self.acquisition_mode == runtime_profile::AcquisitionMode::Offline {
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.phase = "offline";
+                lifecycle.desired_running = false;
+                lifecycle.last_error = "capture is disabled in offline mode".to_string();
+            }
+            return false;
+        }
         if !self.control_allowed {
             if let Ok(mut lifecycle) = self.lifecycle.lock() {
                 lifecycle.last_error =
@@ -1776,6 +1893,10 @@ impl CaptureServiceManager {
     }
 
     fn stop(&self) -> bool {
+        if self.acquisition_mode == runtime_profile::AcquisitionMode::Offline {
+            self.supervisor_tick();
+            return true;
+        }
         if !self.control_allowed {
             if let Ok(mut lifecycle) = self.lifecycle.lock() {
                 lifecycle.last_error =
@@ -1783,7 +1904,9 @@ impl CaptureServiceManager {
             }
             return false;
         }
-        if env::var("STEEL_CAPTURE_MANAGED_BY_SUPERVISOR").as_deref() == Ok("1") {
+        if env::var("STEEL_CAPTURE_MANAGED_BY_SUPERVISOR").as_deref() == Ok("1")
+            && self.provider != CaptureProvider::ExternalApi
+        {
             return true;
         }
         if self.provider == CaptureProvider::Bkv {
@@ -1839,6 +1962,68 @@ impl CaptureServiceManager {
             }
         }
         stopped
+    }
+
+    fn stop_for_mode_transition(&self, timeout: Duration) -> Result<(), String> {
+        if self.acquisition_mode == runtime_profile::AcquisitionMode::Offline
+            || self.provider == CaptureProvider::Bkv
+            || (!self.provider.is_embedded() && !self.endpoint_listening())
+        {
+            return Ok(());
+        }
+        if self.provider == CaptureProvider::ExternalApi {
+            if let Ok(mut lifecycle) = self.lifecycle.lock() {
+                lifecycle.desired_running = false;
+                lifecycle.phase = "stopping";
+                lifecycle.next_restart_at = None;
+            }
+            // The replay sidecar may need to close the active source session and
+            // flush both persistence queues before its stop request returns.  A
+            // normal operator stop uses a short UI timeout, but a mode transition
+            // must give that bounded drain the full transition timeout.  The
+            // response only rejects an explicit refusal; success is established
+            // below from the authoritative health/quiescence contract.
+            if let Some(response) =
+                self.proxy_response_with_read_timeout("POST", "/api/service/stop", "{}", timeout)
+            {
+                let accepted = (200..300).contains(&response.status_code)
+                    && serde_json::from_slice::<Value>(&response.body)
+                        .ok()
+                        .and_then(|value| value.get("code").and_then(Value::as_i64))
+                        == Some(0);
+                if !accepted {
+                    return Err("capture stop request was rejected".to_string());
+                }
+            }
+            self.supervisor_tick();
+        } else if !self.stop() {
+            return Err("capture stop request was rejected".to_string());
+        }
+        if self.provider != CaptureProvider::ExternalApi {
+            return (!self.is_running())
+                .then_some(())
+                .ok_or_else(|| "capture provider did not stop".to_string());
+        }
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let health = self
+                .probe_response("/health", Duration::from_millis(800))
+                .filter(|response| (200..300).contains(&response.status_code))
+                .and_then(|response| serde_json::from_slice::<Value>(&response.body).ok());
+            let Some(health) = health else {
+                if !self.endpoint_listening() {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
+            if capture_transition_health_drained(&health, self.acquisition_mode) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err("capture provider did not enter a flushed quiescent state before timeout".to_string())
     }
 
     fn restart(&self) -> bool {
@@ -1897,6 +2082,7 @@ impl CaptureServiceManager {
         };
         json!({
             "name": "capture-service",
+            "acquisitionMode": self.acquisition_mode,
             "provider": self.provider.as_str(),
             "managed": self.provider.is_managed(),
             "controlAllowed": self.control_allowed,
@@ -1911,6 +2097,12 @@ impl CaptureServiceManager {
             } else {
                 "disabled"
             },
+            "simulation": self.simulation.as_ref().map(|simulation| json!({
+                "configured": !simulation.source_root.trim().is_empty(),
+                "speed": simulation.speed,
+                "loop": simulation.loop_playback,
+                "sessionGapMs": simulation.inter_session_gap_ms,
+            })),
             "lifecycle": {
                 "phase": lifecycle.phase,
                 "desiredRunning": lifecycle.desired_running,
@@ -3934,6 +4126,13 @@ fn same_bkv_inspection_model(
         && left.finished_at == right.finished_at
         && left.capture_count == right.capture_count
         && left.defect_count == right.defect_count
+        && left.source_mode == right.source_mode
+        && left.source_dataset_id == right.source_dataset_id
+        && left.source_run_id == right.source_run_id
+        && left.source_session_id == right.source_session_id
+        && left.source_content_hash == right.source_content_hash
+        && left.replayed == right.replayed
+        && left.production_eligible == right.production_eligible
         && left.raw_payload == right.raw_payload
 }
 
@@ -4222,7 +4421,14 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "time": production_time_label(&inspection.started_at, &inspection.material_id),
             "plateNo": inspection.material_id,
             "status": production_inspection_record_status(inspection),
-            "defectCount": defects.len()
+            "defectCount": defects.len(),
+            "sourceMode": inspection.source_mode,
+            "sourceDatasetId": inspection.source_dataset_id,
+            "sourceRunId": inspection.source_run_id,
+            "sourceSessionId": inspection.source_session_id,
+            "sourceContentHash": inspection.source_content_hash,
+            "replayed": inspection.replayed,
+            "productionEligible": inspection.production_eligible
         }));
         plate_inspections.push(json!({
             "plate": plate,
@@ -4235,7 +4441,20 @@ fn build_production_snapshot_json(state: &ServiceState) -> Result<Option<String>
             "inspectionId": inspection.id,
             "summaryPath": inspection.summary_path,
             "captureSummaryPath": capture_summary_path,
-            "source": if state.capture.provider == CaptureProvider::Bkv { "bkv" } else { "production" }
+            "source": if state.capture.provider == CaptureProvider::Bkv {
+                "bkv"
+            } else if inspection.source_mode == "simulation" {
+                "simulation"
+            } else {
+                "production"
+            },
+            "sourceMode": inspection.source_mode,
+            "sourceDatasetId": inspection.source_dataset_id,
+            "sourceRunId": inspection.source_run_id,
+            "sourceSessionId": inspection.source_session_id,
+            "sourceContentHash": inspection.source_content_hash,
+            "replayed": inspection.replayed,
+            "productionEligible": inspection.production_eligible
         }));
     }
 
@@ -4833,6 +5052,141 @@ fn capture_health_component_with_bkv_runtime(
     if let Some(lifecycle) = lifecycle.as_object_mut() {
         lifecycle.remove("lastError");
     }
+    if state.runtime_config.acquisition_mode == runtime_profile::AcquisitionMode::Offline {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "required": false,
+                "status": "offline",
+                "acquisitionMode": "offline",
+                "provider": state.capture.provider.as_str(),
+                "managed": false,
+                "connected": false,
+                "apiReachable": Value::Null,
+                "sdkRequired": false,
+                "sdkReady": Value::Null,
+                "physicalCamerasOnline": 0,
+                "reason": Value::Null,
+                "lifecycle": lifecycle,
+            }),
+        );
+    }
+    if state.runtime_config.acquisition_mode == runtime_profile::AcquisitionMode::Simulation {
+        let simulation = state.runtime_config.simulation.as_ref();
+        let source_ready =
+            simulation.is_some_and(|settings| Path::new(settings.source_root.trim()).is_dir());
+        let response = (!state.capture.provider.is_embedded()).then(|| {
+            state
+                .capture
+                .probe_response("/health", Duration::from_millis(1_500))
+        });
+        let response = response.flatten();
+        let payload = response
+            .as_ref()
+            .and_then(|response| serde_json::from_slice::<Value>(&response.body).ok());
+        let api_reachable = state.capture.provider.is_embedded()
+            || response
+                .as_ref()
+                .is_some_and(|response| (200..300).contains(&response.status_code));
+        let provider_ready = if state.capture.provider.is_embedded() {
+            state.capture.is_running()
+        } else {
+            payload
+                .as_ref()
+                .and_then(|value| value.get("providerReady").or_else(|| value.get("ready")))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let reported_source_ready = payload
+            .as_ref()
+            .and_then(|value| {
+                value
+                    .get("sourceReady")
+                    .or_else(|| value.pointer("/simulation/sourceAvailable"))
+            })
+            .and_then(Value::as_bool)
+            .unwrap_or(source_ready);
+        let replay_channels = payload.as_ref().and_then(|value| {
+            value
+                .pointer("/simulation/channels")
+                .or_else(|| value.get("replayChannels"))
+                .cloned()
+        });
+        let simulation_channel_count = payload.as_ref().and_then(|value| {
+            value.get("simulationChannelCount").cloned().or_else(|| {
+                replay_channels
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .map(|channels| json!(channels.len()))
+            })
+        });
+        let replay_state = payload.as_ref().and_then(|value| {
+            value
+                .get("state")
+                .or_else(|| value.get("replayState"))
+                .or_else(|| value.pointer("/simulation/state"))
+                .cloned()
+        });
+        let dataset_id = payload.as_ref().and_then(|value| {
+            value
+                .get("datasetId")
+                .or_else(|| value.get("sourceDatasetId"))
+                .or_else(|| value.pointer("/simulation/datasetId"))
+                .or_else(|| value.pointer("/simulation/sourceDatasetId"))
+                .cloned()
+        });
+        let current_session = payload.as_ref().and_then(|value| {
+            value
+                .get("currentSession")
+                .or_else(|| value.get("currentSessionId"))
+                .or_else(|| value.pointer("/simulation/currentSession"))
+                .or_else(|| value.pointer("/simulation/currentSessionId"))
+                .cloned()
+        });
+        let replay_progress = payload.as_ref().and_then(|value| {
+            value
+                .get("progress")
+                .or_else(|| value.pointer("/simulation/progress"))
+                .cloned()
+        });
+        let ok = source_ready && reported_source_ready && api_reachable && provider_ready;
+        let reason = if !source_ready || !reported_source_ready {
+            Some("simulation_source_unavailable")
+        } else if !api_reachable {
+            Some("simulation_provider_unreachable")
+        } else if !provider_ready {
+            Some("simulation_provider_not_ready")
+        } else {
+            None
+        };
+        return (
+            ok,
+            json!({
+                "ok": ok,
+                "readyContribution": ok,
+                "required": true,
+                "status": if ok { "simulation" } else { "unavailable" },
+                "acquisitionMode": "simulation",
+                "provider": state.capture.provider.as_str(),
+                "managed": state.capture.provider.is_managed(),
+                "apiReachable": api_reachable,
+                "sourceReady": source_ready && reported_source_ready,
+                "replayChannels": replay_channels,
+                "simulationChannelCount": simulation_channel_count,
+                "replayState": replay_state,
+                "datasetId": dataset_id,
+                "currentSession": current_session,
+                "progress": replay_progress,
+                "sdkRequired": false,
+                "sdkReady": Value::Null,
+                "physicalCamerasOnline": 0,
+                "reason": reason,
+                "lifecycle": lifecycle,
+            }),
+        );
+    }
     // In split runtime/proxy mode the algorithm service owns BKV MySQL and
     // the six read-only image shares.  The business service must not try to
     // open the legacy replay root (or report it as a readiness failure).
@@ -5091,6 +5445,25 @@ fn storage_health_component_with_timeout_and_bkv_runtime(
         &Result<production_tasks::BkvReplayRuntime, production_tasks::BkvRejection>,
     >,
 ) -> (bool, Value) {
+    if state.runtime_config.acquisition_mode == runtime_profile::AcquisitionMode::Offline
+        && state.capture.provider != CaptureProvider::Bkv
+    {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "required": false,
+                "status": "history-read-only",
+                "provider": state.capture.provider.as_str(),
+                "simulated": false,
+                "apiReachable": Value::Null,
+                "rootWritable": Value::Null,
+                "queueRequired": false,
+                "reason": Value::Null,
+            }),
+        );
+    }
     if unified_result_store_enabled(state) && state.runtime_config.data_source == "bkv-online-mysql"
     {
         let root = env::var("STEEL_RESULT_ROOT")
@@ -7281,6 +7654,32 @@ fn algorithm_health_component(state: &ServiceState) -> (bool, Value) {
 }
 
 fn production_policy_health_component(state: &ServiceState) -> (bool, Value) {
+    if state.runtime_config.acquisition_mode == runtime_profile::AcquisitionMode::Offline {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "status": "offline-not-required",
+                "required": false,
+                "syntheticFixturesAllowed": false,
+                "reason": Value::Null,
+            }),
+        );
+    }
+    if state.runtime_config.acquisition_mode == runtime_profile::AcquisitionMode::Simulation {
+        return (
+            true,
+            json!({
+                "ok": true,
+                "readyContribution": true,
+                "status": "recorded-data-simulation",
+                "required": false,
+                "syntheticFixturesAllowed": false,
+                "reason": Value::Null,
+            }),
+        );
+    }
     if state.capture.provider == CaptureProvider::Simulated {
         let allowed =
             synthetic_algorithm_fixtures_allowed(&state.runtime_profile, &state.algorithm_mode);
@@ -7373,8 +7772,23 @@ fn external_processing_policy_ready(algorithm_mode: &str, mock_count: Option<u64
 }
 
 fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
+    let acquisition_mode = state.runtime_config.acquisition_mode;
+    let mode_not_required = |status: &'static str| {
+        json!({
+            "ok": true,
+            "readyContribution": true,
+            "required": false,
+            "status": status,
+            "reason": Value::Null,
+        })
+    };
     let (database_ok, database) = database_health_component(state);
-    let (worker_ok, task_worker) = task_worker_health_component(state);
+    let (worker_ok, task_worker) = if acquisition_mode == runtime_profile::AcquisitionMode::Offline
+    {
+        (true, mode_not_required("offline-not-required"))
+    } else {
+        task_worker_health_component(state)
+    };
     let shared_bkv_runtime =
         if state.capture.provider == CaptureProvider::Bkv && !unified_result_store_enabled(state) {
             Some(production_tasks::configured_bkv_root().and_then(|root| {
@@ -7392,14 +7806,27 @@ fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
     let (capture_ok, capture) =
         capture_health_component_with_bkv_runtime(state, shared_bkv_runtime.as_ref());
     let (calibration_ok, calibration_reconciliation) =
-        calibration_reconciliation_health_component(state);
+        if acquisition_mode == runtime_profile::AcquisitionMode::Offline {
+            (true, mode_not_required("offline-not-required"))
+        } else {
+            calibration_reconciliation_health_component(state)
+        };
     let (storage_ok, storage) = storage_health_component_with_timeout_and_bkv_runtime(
         state,
         Duration::from_millis(STORAGE_HEALTH_TIMEOUT_MS),
         shared_bkv_runtime.as_ref(),
     );
-    let (trigger_ok, trigger) = trigger_health_component(state);
-    let (algorithm_ok, algorithm) = algorithm_health_component(state);
+    let (trigger_ok, trigger) = if acquisition_mode.physical_camera_required() {
+        trigger_health_component(state)
+    } else {
+        (true, mode_not_required("mode-not-required"))
+    };
+    let (algorithm_ok, algorithm) = if acquisition_mode == runtime_profile::AcquisitionMode::Offline
+    {
+        (true, mode_not_required("offline-not-required"))
+    } else {
+        algorithm_health_component(state)
+    };
     let (production_policy_ok, production_policy) = production_policy_health_component(state);
     let ready = database_ok
         && worker_ok
@@ -7416,6 +7843,7 @@ fn service_health_snapshot(state: &ServiceState) -> ServiceHealthSnapshot {
             "status": if ready { "ready" } else { "not-ready" },
             "service": "steel-inspection-service",
             "language": "rust",
+            "acquisitionMode": acquisition_mode,
             "uptimeMs": current_time_millis().saturating_sub(state.started_at),
             "checks": {
                 "database": database,
@@ -7983,7 +8411,54 @@ fn capture_camera_alarm_signature(capture: &Value) -> Option<String> {
     )
 }
 
+fn resolve_capture_camera_alarms_for_inactive_mode(state: &ServiceState) -> Result<(), String> {
+    let mut offset = 0_u64;
+    let mut alarms = Vec::new();
+    loop {
+        let page = state
+            .runtime
+            .block_on(db::list_production_alarms(
+                &state.database.connection,
+                db::ProductionAlarmFilter {
+                    status: Some("open".to_string()),
+                    limit: Some(200),
+                    offset: Some(offset),
+                    ..db::ProductionAlarmFilter::default()
+                },
+            ))
+            .map_err(|error| error.to_string())?;
+        let count = page.alarms.len() as u64;
+        alarms.extend(page.alarms);
+        offset = offset.saturating_add(count);
+        if count == 0 || offset >= page.total {
+            break;
+        }
+    }
+    for alarm in alarms.into_iter().filter(|alarm| {
+        alarm.source.starts_with("capture-camera-image-quality:")
+            && CAPTURE_CAMERA_ALARM_TYPES.contains(&alarm.alarm_type.as_str())
+    }) {
+        state
+            .runtime
+            .block_on(db::reconcile_managed_alarm(
+                &state.database.connection,
+                &alarm.source,
+                &alarm.alarm_type,
+                None,
+                CAPTURE_CAMERA_ALARM_ACTOR,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn start_capture_camera_alarm_monitor(state: Arc<ServiceState>) {
+    if state.runtime_config.acquisition_mode != runtime_profile::AcquisitionMode::Online {
+        if let Err(error) = resolve_capture_camera_alarms_for_inactive_mode(&state) {
+            eprintln!("failed to resolve camera alarms for inactive acquisition mode: {error}");
+        }
+        return;
+    }
     if state.capture.provider != CaptureProvider::ExternalApi {
         return;
     }
@@ -8369,6 +8844,8 @@ fn is_production_mutation_route(method: &str, path: &str) -> bool {
                     | "/api/bkv/replay/reset"
                     | "/internal/v1/steel-in"
                     | "/internal/v1/steel-out"
+                    | "/internal/v1/capture-commit"
+                    | "/internal/v1/capture-regions"
                     | "/internal/v1/defect-batch"
                     | "/api/defects/review"
             ))
@@ -8656,6 +9133,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/capture/latest"),
     ("GET", "/api/capture/history"),
     ("GET", "/api/capture/cache/status"),
+    ("GET", "/api/capture/simulation/status"),
     ("GET", "/api/capture/continuous-settings"),
     ("GET", "/api/capture/alignment"),
     ("GET", "/api/capture/measurement"),
@@ -8689,6 +9167,7 @@ const CAPTURE_JSON_PROXY_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/capture/depth-map"),
     ("POST", "/api/capture/continuous-test"),
     ("POST", "/api/capture/continuous-settings"),
+    ("POST", "/api/capture/simulation/control"),
     ("POST", "/api/capture/preset/line-continuous"),
     ("POST", "/api/stream/start"),
     ("POST", "/api/stream/stop"),
@@ -8933,12 +9412,14 @@ fn runtime_drain_status_json(state: &ServiceState) -> Value {
             "draining": !admission.accepting,
             "accepting": admission.accepting,
             "acceptingNewProduction": admission.accepting,
+            "acceptingCompletion": admission.completion_accepting,
             "inFlight": admission.in_flight
         }),
         Err(_) => json!({
             "draining": true,
             "accepting": false,
             "acceptingNewProduction": false,
+            "acceptingCompletion": false,
             "inFlight": 1,
             "error": "runtime_admission_state_unavailable"
         }),
@@ -8974,7 +9455,10 @@ fn runtime_completion_route(method: &str, path: &str) -> bool {
             "/api/production/steel-out"
                 | "/api/production/tasks/steel-out"
                 | "/api/production/tasks/cancel"
-                | "/api/production/tasks"
+                | "/internal/v1/steel-out"
+                | "/internal/v1/capture-commit"
+                | "/internal/v1/capture-regions"
+                | "/internal/v1/defect-batch"
         )
 }
 
@@ -8983,7 +9467,7 @@ fn enter_runtime_admission<'a>(
     method: &str,
     path: &str,
 ) -> Result<Option<RuntimeAdmissionGuard<'a>>, Vec<u8>> {
-    if !matches!(method, "POST" | "DELETE") || path == "/api/runtime/drain" {
+    if !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") || path == "/api/runtime/drain" {
         return Ok(None);
     }
     let mut admission = state.runtime_admission.lock().map_err(|_| {
@@ -8993,7 +9477,9 @@ fn enter_runtime_admission<'a>(
             &json!({ "code": 503, "error": "runtime_admission_state_unavailable" }).to_string(),
         )
     })?;
-    if !admission.accepting && !runtime_completion_route(method, path) {
+    if !admission.accepting
+        && !(admission.completion_accepting && runtime_completion_route(method, path))
+    {
         drop(admission);
         return Err(runtime_draining_http_response(state, path));
     }
@@ -9235,6 +9721,7 @@ fn permission_for_route(method: &str, path: &str) -> Option<&'static str> {
         | ("POST", "/api/capture/start")
         | ("POST", "/api/capture/stop")
         | ("POST", "/api/capture/restart")
+        | ("POST", "/api/capture/simulation/control")
         | ("POST", "/api/trigger/mode")
         | ("POST", "/api/trigger/manual/steel-info")
         | ("POST", "/api/trigger/manual/steel-in")
@@ -10367,7 +10854,10 @@ fn runtime_service_values(state: &ServiceState) -> Vec<Value> {
         .services
         .iter()
         .map(|registration| {
-            let mut required = registration.required_for_provider(state.capture.provider.as_str());
+            let acquisition_mode = state.runtime_config.acquisition_mode.as_str();
+            let enabled_for_mode = registration.enabled_for_mode(acquisition_mode);
+            let mut required =
+                registration.required_for_mode(state.capture.provider.as_str(), acquisition_mode);
             if registration.id == "trigger" {
                 required = state.trigger_health_required;
             }
@@ -10430,6 +10920,16 @@ fn runtime_service_values(state: &ServiceState) -> Vec<Value> {
                 _ => runtime_log_service_probe(registration, required),
             };
             attach_runtime_monitor_contract(&mut service, registration);
+            if let Some(object) = service.as_object_mut() {
+                object.insert("acquisitionMode".to_string(), json!(acquisition_mode));
+                object.insert("enabledForMode".to_string(), json!(enabled_for_mode));
+                if !enabled_for_mode {
+                    object.insert("ok".to_string(), json!(true));
+                    object.insert("required".to_string(), json!(false));
+                    object.insert("status".to_string(), json!("disabled-for-mode"));
+                    object.insert("reason".to_string(), Value::Null);
+                }
+            }
             service
         })
         .collect()
@@ -10539,7 +11039,8 @@ fn runtime_log_status_json(state: &ServiceState) -> String {
             "stateRoot": state_root,
             "logRoot": log_root,
             "supervisor": supervisor,
-            "taskWorker": task_worker_health_component(state).1
+            "taskWorker": task_worker_health_component(state).1,
+            "modeTransition": runtime_mode_transition_status(state)
         },
         "resultStore": {
             "root": result_root,
@@ -14567,11 +15068,26 @@ fn write_production_event_response(
         }
     }
     let provider_body = provider_payload.to_string();
-    let provider_response = state
-        .capture
-        .proxy("POST", "/api/steel/event", &provider_body)
-        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
-        .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }));
+    // In simulation mode the replay coordinator is already executing inside
+    // the capture provider. Calling it back here would create a recursive HTTP
+    // round trip and collide with the physical-operation mode guard. The
+    // coordinator applies its local virtual steel event only after this
+    // authoritative database transaction returns code 0.
+    let provider_response =
+        if state.capture.acquisition_mode == runtime_profile::AcquisitionMode::Simulation {
+            json!({
+                "code": 0,
+                "provider": "simulation-replay-coordinator",
+                "runtimeMode": "simulation",
+                "databaseRegisteredBeforeLocalCapture": true
+            })
+        } else {
+            state
+                .capture
+                .proxy("POST", "/api/steel/event", &provider_body)
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .unwrap_or_else(|| json!({ "code": 503, "error": "capture_provider_offline" }))
+        };
     let provider_code = provider_code_from_response(&provider_response, 503);
     let trigger_result = state.runtime.block_on(db::append_trigger_event(
         &state.database.connection,
@@ -18543,9 +19059,14 @@ fn runtime_capability_for_route(
     if !matches!(method, "POST" | "DELETE" | "PUT" | "PATCH") {
         return None;
     }
+    if matches!(path, "/api/bkv/replay/next" | "/api/bkv/replay/reset") {
+        return Some(RuntimeCapability::OfflineReplay);
+    }
     if path == "/api/algorithm/bar-surface/run"
         || path == "/api/algorithm/bar-surface/calibration/fit"
         || path == "/api/production/algorithm/run"
+        || path == "/api/admin/algorithm/depth-geometry/backfill"
+        || path == "/api/admin/algorithm/depth-geometry/backfill/resume"
         || matches!(
             path,
             "/api/capture/alignment/rebuild"
@@ -18555,7 +19076,9 @@ fn runtime_capability_for_route(
     {
         return Some(RuntimeCapability::Reconstruction);
     }
-    if path == "/api/admin/cameras"
+    if path == "/api/config/capture"
+        || path == "/api/admin/cameras"
+        || path.starts_with("/api/config/profile/")
         || path.starts_with("/api/camera/")
         || path.starts_with("/api/cameras/")
         || path.starts_with("/api/config/camera-")
@@ -18566,15 +19089,24 @@ fn runtime_capability_for_route(
         || path.starts_with("/api/preview/")
         || path.starts_with("/api/capture/preview")
         || path.starts_with("/api/capture/depth-map")
+        || path.starts_with("/api/capture/continuous")
+        || path.starts_with("/api/capture/preset")
     {
         return Some(RuntimeCapability::DirectCamera);
     }
-    if path == "/api/config/capture"
-        || path == "/api/production/capture-once"
+    if path == "/api/production/capture-once"
+        || path == "/api/production/tasks/retry"
+        || path == "/api/storage/config"
+        || path == "/api/storage/camera-roots"
+        || path == "/api/steel/capture-mode"
+        || path == "/api/steel/event"
+        || path.starts_with("/api/trigger/")
         || matches!(
             path,
             "/internal/v1/steel-in"
                 | "/internal/v1/steel-out"
+                | "/internal/v1/capture-commit"
+                | "/internal/v1/capture-regions"
                 | "/api/production/tasks/steel-info"
                 | "/api/production/tasks/steel-in"
                 | "/api/production/tasks/steel-out"
@@ -18583,11 +19115,16 @@ fn runtime_capability_for_route(
                 | "/api/production/steel-in"
                 | "/api/production/steel-out"
                 | "/api/production/trigger-event"
+                | "/api/production/secondary-data"
+                | "/api/production/capture-summary"
         )
         || path.starts_with("/api/admin/services/capture/")
         || path.starts_with("/api/capture/")
     {
         return Some(RuntimeCapability::CaptureManagement);
+    }
+    if matches!(path, "/api/production/defect" | "/internal/v1/defect-batch") {
+        return Some(RuntimeCapability::Reconstruction);
     }
     None
 }
@@ -18597,9 +19134,9 @@ fn runtime_capability_for_production_task_kind(
 ) -> Option<runtime_profile::RuntimeCapability> {
     use runtime_profile::RuntimeCapability;
 
-    match kind.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-        "algorithm" | "algorithm-run" => Some(RuntimeCapability::Reconstruction),
-        "capture" | "capture-once" | "steel-info" | "steel-in" | "steel-out" | "trigger-event" => {
+    match production_tasks::normalize_kind(kind)? {
+        "algorithm-run" => Some(RuntimeCapability::Reconstruction),
+        "capture-once" | "steel-info" | "steel-in" | "steel-out" | "trigger-event" => {
             Some(RuntimeCapability::CaptureManagement)
         }
         _ => None,
@@ -18664,6 +19201,101 @@ fn runtime_capability_guard_response_for_request(
             "capability": capability.as_str(),
             "profileId": state.runtime_config.id,
             "message": "The active runtime profile does not provide this capability"
+        })
+        .to_string(),
+    ))
+}
+
+fn runtime_mode_guard_response_for_request(
+    state: &ServiceState,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Option<Vec<u8>> {
+    if matches!(
+        (method, path),
+        ("GET", "/api/capture/simulation/status") | ("POST", "/api/capture/simulation/control")
+    ) && state.runtime_config.acquisition_mode != runtime_profile::AcquisitionMode::Simulation
+    {
+        let (error, message) = match state.runtime_config.acquisition_mode {
+            runtime_profile::AcquisitionMode::Online => (
+                "mode_online",
+                "simulation endpoint requires acquisitionMode=simulation",
+            ),
+            runtime_profile::AcquisitionMode::Offline => ("mode_offline", "采集和新处理已禁用"),
+            runtime_profile::AcquisitionMode::Simulation => unreachable!(),
+        };
+        return Some(http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": error,
+                "acquisitionMode": state.runtime_config.acquisition_mode,
+                "profileId": state.runtime_config.id,
+                "message": message,
+            })
+            .to_string(),
+        ));
+    }
+    if state.runtime_config.acquisition_mode == runtime_profile::AcquisitionMode::Simulation
+        && matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+        && (path.starts_with("/api/trigger/")
+            || matches!(path, "/api/steel/capture-mode" | "/api/steel/event"))
+    {
+        return Some(http_response(
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            &json!({
+                "code": 409,
+                "error": "mode_simulation_physical_operation_forbidden",
+                "acquisitionMode": state.runtime_config.acquisition_mode,
+                "capability": "physical-trigger",
+                "profileId": state.runtime_config.id,
+                "message": "模拟模式禁止 PLC 和物理触发操作",
+            })
+            .to_string(),
+        ));
+    }
+    let capability = runtime_capability_for_request(method, path, body)?;
+    let (error, message) = match (state.runtime_config.acquisition_mode, capability) {
+        (
+            runtime_profile::AcquisitionMode::Offline,
+            runtime_profile::RuntimeCapability::OfflineReplay,
+        ) => return None,
+        (runtime_profile::AcquisitionMode::Offline, _) => ("mode_offline", "采集和新处理已禁用"),
+        (
+            runtime_profile::AcquisitionMode::Simulation,
+            runtime_profile::RuntimeCapability::DirectCamera,
+        ) => (
+            "mode_simulation_physical_operation_forbidden",
+            "模拟模式禁止物理相机操作",
+        ),
+        (
+            runtime_profile::AcquisitionMode::Simulation,
+            runtime_profile::RuntimeCapability::CaptureManagement,
+        ) if path == "/api/capture/simulation/control" || path.starts_with("/internal/v1/") => {
+            return None
+        }
+        (
+            runtime_profile::AcquisitionMode::Simulation,
+            runtime_profile::RuntimeCapability::CaptureManagement,
+        ) => (
+            "mode_simulation_replay_control_required",
+            "模拟采集只能通过数据回放控制接口驱动",
+        ),
+        _ => return None,
+    };
+    Some(http_response(
+        "409 Conflict",
+        "application/json; charset=utf-8",
+        &json!({
+            "code": 409,
+            "error": error,
+            "acquisitionMode": state.runtime_config.acquisition_mode,
+            "capability": capability.as_str(),
+            "profileId": state.runtime_config.id,
+            "message": message,
         })
         .to_string(),
     ))
@@ -18795,6 +19427,295 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
+fn runtime_mode_commit_path_for_project(project_path: &Path) -> Result<PathBuf, String> {
+    let workspace_root = project_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "runtime project path has no workspace root".to_string())?;
+    Ok(workspace_root.join(RUNTIME_MODE_COMMIT_RELATIVE_PATH))
+}
+
+fn runtime_mode_commit_path(state: &ServiceState) -> Result<PathBuf, String> {
+    runtime_mode_commit_path_for_project(&state.runtime_config.project_path)
+}
+
+struct StagedRuntimeProfile {
+    path: PathBuf,
+    relative_path: String,
+    retain_for_recovery: bool,
+}
+
+impl StagedRuntimeProfile {
+    fn prepare(state: &ServiceState, transition_id: &str, bytes: &[u8]) -> Result<Self, String> {
+        let workspace_root = state
+            .runtime_config
+            .project_path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "runtime project path has no workspace root".to_string())?;
+        let relative_path = format!("config/runtime-mode-staging/{transition_id}.json");
+        let path = workspace_root.join(Path::new(&relative_path));
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| "runtime mode staging path has no parent".to_string())?,
+        )
+        .map_err(|error| format!("runtime mode staging directory create failed: {error}"))?;
+        write_bytes_atomic(&path, bytes)?;
+        Ok(Self {
+            path,
+            relative_path,
+            retain_for_recovery: false,
+        })
+    }
+
+    fn retain_for_recovery(&mut self) {
+        self.retain_for_recovery = true;
+    }
+}
+
+impl Drop for StagedRuntimeProfile {
+    fn drop(&mut self) {
+        if !self.retain_for_recovery {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn publish_runtime_mode_commit(
+    state: &ServiceState,
+    commit_state: &str,
+    mode: runtime_profile::AcquisitionMode,
+    config_hash: &str,
+    actor: &str,
+    previous_mode: Option<runtime_profile::AcquisitionMode>,
+    target_mode: Option<runtime_profile::AcquisitionMode>,
+    transition_id: Option<&str>,
+    release_after_millis: Option<u64>,
+    profile_sha256_override: Option<&str>,
+    staged_profile: Option<&str>,
+) -> Result<(), String> {
+    let path = runtime_mode_commit_path(state)?;
+    let profile_bytes = fs::read(&state.runtime_config.profile_path)
+        .map_err(|error| format!("runtime profile hash read failed: {error}"))?;
+    let computed_profile_sha256 = format!("{:x}", Sha256::digest(&profile_bytes));
+    let profile_sha256 = profile_sha256_override.unwrap_or(&computed_profile_sha256);
+    let mut payload = json!({
+        "schema": "steel.runtime-mode-commit.v1",
+        "state": commit_state,
+        "profileId": state.runtime_config.id,
+        "acquisitionMode": mode,
+        "configHash": config_hash,
+        "profileSha256": profile_sha256,
+        "actor": actor,
+        "updatedAt": current_time_millis().to_string(),
+    });
+    if let Some(previous_mode) = previous_mode {
+        payload["previousAcquisitionMode"] = json!(previous_mode);
+    }
+    if let Some(target_mode) = target_mode {
+        payload["targetAcquisitionMode"] = json!(target_mode);
+    }
+    if let Some(transition_id) = transition_id {
+        payload["transitionId"] = json!(transition_id);
+    }
+    if let Some(release_after_millis) = release_after_millis {
+        payload["releaseAfterMillis"] = json!(release_after_millis);
+    }
+    if let Some(staged_profile) = staged_profile {
+        payload["stagedProfile"] = json!(staged_profile);
+    }
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("runtime mode commit serialization failed: {error}"))?;
+    write_bytes_atomic(&path, &bytes)
+}
+
+fn validate_runtime_mode_commit_for_startup(
+    profile: &runtime_profile::RuntimeProfile,
+) -> Result<(), String> {
+    let path = runtime_mode_commit_path_for_project(&profile.project_path)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| format!("runtime mode commit read failed: {error}"))?;
+    let marker: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("runtime mode commit JSON invalid: {error}"))?;
+    if marker.get("schema").and_then(Value::as_str) != Some("steel.runtime-mode-commit.v1") {
+        return Err("runtime mode commit schema is invalid".to_string());
+    }
+    let marked_mode = marker
+        .get("acquisitionMode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "runtime mode commit acquisitionMode is missing".to_string())?;
+    let profile_bytes = fs::read(&profile.profile_path)
+        .map_err(|error| format!("runtime profile hash read failed: {error}"))?;
+    let actual_sha256 = format!("{:x}", Sha256::digest(&profile_bytes));
+    let marked_sha256 = marker
+        .get("profileSha256")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "runtime mode commit profileSha256 is invalid".to_string())?;
+    let marker_matches_profile = marked_mode
+        .eq_ignore_ascii_case(profile.acquisition_mode.as_str())
+        && marked_sha256.eq_ignore_ascii_case(&actual_sha256);
+    match marker.get("state").and_then(Value::as_str) {
+        Some("committed") if marker_matches_profile => {}
+        Some("fence") if marker_matches_profile => {
+            // A crash before publishing new profile bytes is safe to recover in
+            // the previous mode because the fence still describes those bytes.
+        }
+        Some("ready") if marker_matches_profile => {
+            let release_after = marker
+                .get("releaseAfterMillis")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "runtime mode ready marker releaseAfterMillis is invalid".to_string())?;
+            let now = u64::try_from(current_time_millis()).unwrap_or(u64::MAX);
+            if now < release_after {
+                return Err("runtime mode transition is committed but not released".to_string());
+            }
+        }
+        Some("committed" | "fence" | "ready") => {
+            return Err(
+                "runtime mode transition marker does not match the selected profile; refusing split-brain startup"
+                    .to_string(),
+            )
+        }
+        _ => return Err("runtime mode commit state is invalid".to_string()),
+    }
+    if let Ok(expected_mode) = env::var("STEEL_ACQUISITION_MODE") {
+        let expected_mode = expected_mode.trim().to_ascii_lowercase();
+        if !matches!(expected_mode.as_str(), "online" | "offline" | "simulation") {
+            return Err("STEEL_ACQUISITION_MODE is invalid".to_string());
+        }
+        if expected_mode != profile.acquisition_mode.as_str() {
+            return Err(format!(
+                "supervisor mode {expected_mode} does not match profile mode {}; refusing split-brain startup",
+                profile.acquisition_mode.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_active_runtime_mode_commit(state: &ServiceState, actor: &str) -> bool {
+    publish_runtime_mode_commit(
+        state,
+        "committed",
+        state.runtime_config.acquisition_mode,
+        &state.runtime_config.config_hash,
+        actor,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .is_ok()
+}
+
+fn runtime_mode_transition_status(state: &ServiceState) -> Value {
+    let Ok(path) = runtime_mode_commit_path(state) else {
+        return json!({ "state": "unavailable" });
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return json!({
+            "state": "legacy-unmarked",
+            "acquisitionMode": state.runtime_config.acquisition_mode
+        });
+    };
+    let Ok(marker) = serde_json::from_slice::<Value>(&bytes) else {
+        return json!({ "state": "invalid" });
+    };
+    json!({
+        "state": marker.get("state").cloned().unwrap_or(Value::Null),
+        "transitionId": marker.get("transitionId").cloned().unwrap_or(Value::Null),
+        "previousAcquisitionMode": marker.get("previousAcquisitionMode").cloned().unwrap_or(Value::Null),
+        "targetAcquisitionMode": marker.get("targetAcquisitionMode").cloned().unwrap_or_else(|| marker.get("acquisitionMode").cloned().unwrap_or(Value::Null)),
+        "releaseAfterMillis": marker.get("releaseAfterMillis").cloned().unwrap_or(Value::Null),
+        "configHash": marker.get("configHash").cloned().unwrap_or(Value::Null),
+        "updatedAt": marker.get("updatedAt").cloned().unwrap_or(Value::Null),
+        "committedAt": marker.get("committedAt").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn set_runtime_transition_admission(state: &ServiceState, accepting: bool) -> Result<(), String> {
+    let mut admission = state
+        .runtime_admission
+        .lock()
+        .map_err(|_| "runtime admission state unavailable".to_string())?;
+    if !accepting && !admission.accepting {
+        return Err("another runtime drain or mode transition is already active".to_string());
+    }
+    admission.accepting = accepting;
+    admission.completion_accepting = true;
+    Ok(())
+}
+
+fn wait_for_runtime_transition_processing_drain<'a>(
+    state: &'a ServiceState,
+    timeout: Duration,
+) -> Result<std::sync::MutexGuard<'a, ()>, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let open_tasks = state
+            .runtime
+            .block_on(db::count_open_production_tasks(&state.database.connection))
+            .map_err(|error| format!("production task drain query failed: {error}"))?;
+        let worker_busy = state
+            .production_task_worker_status
+            .lock()
+            .map_err(|_| "production task worker status unavailable".to_string())?
+            .current_task_id
+            .is_empty()
+            == false;
+        let in_flight = state
+            .runtime_admission
+            .lock()
+            .map_err(|_| "runtime admission state unavailable".to_string())?
+            .in_flight;
+        if open_tasks == 0 && !worker_busy && in_flight <= 1 {
+            match state.production_command_lock.try_lock() {
+                Ok(guard) => {
+                    let open_tasks = state
+                        .runtime
+                        .block_on(db::count_open_production_tasks(&state.database.connection))
+                        .map_err(|error| {
+                            format!("production task drain verification failed: {error}")
+                        })?;
+                    let worker_busy = state
+                        .production_task_worker_status
+                        .lock()
+                        .map_err(|_| "production task worker status unavailable".to_string())?
+                        .current_task_id
+                        .is_empty()
+                        == false;
+                    let mut admission = state
+                        .runtime_admission
+                        .lock()
+                        .map_err(|_| "runtime admission state unavailable".to_string())?;
+                    admission.completion_accepting = false;
+                    let in_flight = admission.in_flight;
+                    if open_tasks == 0 && !worker_busy && in_flight <= 1 {
+                        return Ok(guard);
+                    }
+                    admission.completion_accepting = true;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("production command lock poisoned".to_string())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "runtime processing did not drain before timeout (openTasks={open_tasks}, workerBusy={worker_busy}, inFlight={in_flight})"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(not(windows))]
 fn replace_existing_file(source: &Path, target: &Path) -> Result<(), String> {
     fs::rename(source, target).map_err(|error| format!("runtime profile publish failed: {error}"))
@@ -18856,49 +19777,400 @@ fn save_admin_runtime_profile_response(state: &ServiceState, body: &str, actor: 
             )
         }
     };
-    let previous = match fs::read(&state.runtime_config.profile_path) {
-        Ok(previous) => previous,
+    let target_mode = match state.runtime_config.candidate_acquisition_mode(&candidate) {
+        Ok(mode) => mode,
         Err(error) => {
             return http_response(
-                "500 Internal Server Error",
+                "400 Bad Request",
                 "application/json; charset=utf-8",
-                &json!({"code": 500, "error": "runtime_profile_read_failed", "detail": error.to_string()}).to_string(),
+                &json!({"code": 400, "error": "runtime_profile_invalid", "detail": error})
+                    .to_string(),
             )
         }
     };
-    if let Err(error) = write_bytes_atomic(&state.runtime_config.profile_path, &bytes) {
-        return http_response(
-            "500 Internal Server Error",
-            "application/json; charset=utf-8",
-            &json!({"code": 500, "error": "runtime_profile_save_failed", "detail": error})
+    let mode_change = target_mode != state.runtime_config.acquisition_mode;
+    let transition_id = mode_change.then(|| {
+        format!(
+            "mode-{}-{}",
+            current_time_millis(),
+            saved_hash.get(..12).unwrap_or(saved_hash.as_str())
+        )
+    });
+    let mut staged_profile = if let Some(transition_id) = transition_id.as_deref() {
+        match StagedRuntimeProfile::prepare(state, transition_id, &bytes) {
+            Ok(staged) => Some(staged),
+            Err(error) => {
+                return http_response(
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 500,
+                        "error": "runtime_mode_transition_stage_failed",
+                        "activeAcquisitionMode": state.runtime_config.acquisition_mode,
+                        "targetAcquisitionMode": target_mode,
+                        "detail": error,
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let capture_was_active = mode_change
+        && state.runtime_config.acquisition_mode != runtime_profile::AcquisitionMode::Offline
+        && (state.capture.is_running() || state.capture.endpoint_listening());
+    if mode_change {
+        if let Err(error) = set_runtime_transition_admission(state, false) {
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 409,
+                    "error": "runtime_mode_transition_already_active",
+                    "activeAcquisitionMode": state.runtime_config.acquisition_mode,
+                    "targetAcquisitionMode": target_mode,
+                    "detail": error,
+                })
                 .to_string(),
-        );
+            );
+        }
+        if let Err(error) = publish_runtime_mode_commit(
+            state,
+            "fence",
+            state.runtime_config.acquisition_mode,
+            &state.runtime_config.config_hash,
+            actor,
+            Some(state.runtime_config.acquisition_mode),
+            Some(target_mode),
+            transition_id.as_deref(),
+            None,
+            None,
+            staged_profile
+                .as_ref()
+                .map(|staged| staged.relative_path.as_str()),
+        ) {
+            let admission_restored = set_runtime_transition_admission(state, true).is_ok();
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 500,
+                    "error": "runtime_mode_transition_fence_failed",
+                    "activeAcquisitionMode": state.runtime_config.acquisition_mode,
+                    "targetAcquisitionMode": target_mode,
+                    "detail": error,
+                    "admissionRestored": admission_restored,
+                })
+                .to_string(),
+            );
+        }
+        if let Err(error) = state
+            .capture
+            .stop_for_mode_transition(Duration::from_secs(15))
+        {
+            let commit_restored = restore_active_runtime_mode_commit(state, actor);
+            let admission_restored = set_runtime_transition_admission(state, true).is_ok();
+            let rollback_restarted = capture_was_active && state.capture.start();
+            return http_response(
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 409,
+                    "error": "runtime_mode_transition_capture_stop_failed",
+                    "activeAcquisitionMode": state.runtime_config.acquisition_mode,
+                    "targetAcquisitionMode": target_mode,
+                    "detail": error,
+                    "commitRestored": commit_restored,
+                    "admissionRestored": admission_restored,
+                    "rollbackRestarted": rollback_restarted,
+                })
+                .to_string(),
+            );
+        }
     }
+    let restart_after_rollback = || capture_was_active && state.capture.start();
+    let _processing_barrier = if mode_change {
+        match wait_for_runtime_transition_processing_drain(
+            state,
+            RUNTIME_MODE_TRANSITION_DRAIN_TIMEOUT,
+        ) {
+            Ok(barrier) => Some(barrier),
+            Err(error) => {
+                let commit_restored = restore_active_runtime_mode_commit(state, actor);
+                let admission_restored = set_runtime_transition_admission(state, true).is_ok();
+                let rollback_restarted = restart_after_rollback();
+                return http_response(
+                    "409 Conflict",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 409,
+                        "error": "runtime_mode_transition_processing_drain_failed",
+                        "activeAcquisitionMode": state.runtime_config.acquisition_mode,
+                        "targetAcquisitionMode": target_mode,
+                        "detail": error,
+                        "commitRestored": commit_restored,
+                        "admissionRestored": admission_restored,
+                        "rollbackRestarted": rollback_restarted,
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let previous = match fs::read(&state.runtime_config.profile_path) {
+        Ok(previous) => previous,
+        Err(error) => {
+            let commit_restored = !mode_change || restore_active_runtime_mode_commit(state, actor);
+            let admission_restored =
+                !mode_change || set_runtime_transition_admission(state, true).is_ok();
+            let rollback_restarted = restart_after_rollback();
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 500,
+                    "error": "runtime_profile_read_failed",
+                    "detail": error.to_string(),
+                    "commitRestored": commit_restored,
+                    "admissionRestored": admission_restored,
+                    "rollbackRestarted": rollback_restarted,
+                })
+                .to_string(),
+            );
+        }
+    };
     let value = String::from_utf8_lossy(&bytes).to_string();
-    if let Err(error) = state.runtime.block_on(db::append_config_revision(
-        &state.database.connection,
-        "runtime-profile",
-        &value,
+    if !mode_change {
+        if let Err(error) = write_bytes_atomic(&state.runtime_config.profile_path, &bytes) {
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 500,
+                    "error": "runtime_profile_save_failed",
+                    "detail": error,
+                })
+                .to_string(),
+            );
+        }
+    }
+    let metadata_receipt =
+        match state
+            .runtime
+            .block_on(db::append_runtime_profile_revision_and_audit(
+                &state.database.connection,
+                &value,
+                actor,
+                &state.runtime_config.id,
+            )) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let rollback_saved = if mode_change {
+                    Ok(())
+                } else {
+                    write_bytes_atomic(&state.runtime_config.profile_path, &previous)
+                };
+                let commit_restored =
+                    !mode_change || restore_active_runtime_mode_commit(state, actor);
+                let admission_restored =
+                    !mode_change || set_runtime_transition_admission(state, true).is_ok();
+                let rollback_restarted = restart_after_rollback();
+                let detail = error.to_string();
+                let error_code = if detail.contains("runtime_profile_revision_failed") {
+                    "runtime_profile_revision_failed"
+                } else if detail.contains("runtime_profile_audit_failed") {
+                    "runtime_profile_audit_failed"
+                } else {
+                    "runtime_profile_metadata_commit_failed"
+                };
+                return http_response(
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "code": 500,
+                        "error": error_code,
+                        "detail": detail,
+                        "rollbackSaved": rollback_saved.is_ok(),
+                        "rollbackError": rollback_saved.err(),
+                        "commitRestored": commit_restored,
+                        "admissionRestored": admission_restored,
+                        "rollbackRestarted": rollback_restarted,
+                    })
+                    .to_string(),
+                );
+            }
+        };
+    if mode_change {
+        if let Err(error) = publish_runtime_mode_commit(
+            state,
+            "publish",
+            target_mode,
+            &saved_hash,
+            actor,
+            Some(state.runtime_config.acquisition_mode),
+            Some(target_mode),
+            transition_id.as_deref(),
+            None,
+            Some(&format!("{:x}", Sha256::digest(&bytes))),
+            staged_profile
+                .as_ref()
+                .map(|staged| staged.relative_path.as_str()),
+        ) {
+            let metadata_rollback =
+                state
+                    .runtime
+                    .block_on(db::rollback_runtime_profile_revision_and_audit(
+                        &state.database.connection,
+                        &metadata_receipt,
+                    ));
+            let metadata_rolled_back = metadata_rollback.is_ok();
+            if !metadata_rolled_back {
+                if let Some(staged) = staged_profile.as_mut() {
+                    staged.retain_for_recovery();
+                }
+                return http_response(
+                    "202 Accepted",
+                    "application/json; charset=utf-8",
+                    &json!({
+                        "saved": true,
+                        "profileId": state.runtime_config.id,
+                        "restartRequired": saved_hash != state.runtime_config.config_hash,
+                        "activeConfigHash": state.runtime_config.config_hash,
+                        "savedConfigHash": saved_hash,
+                        "modeTransitionAccepted": true,
+                        "modeTransitionCommitted": false,
+                        "modeTransitionState": "metadata-committed-recovery-required",
+                        "recoveryRequired": true,
+                        "transitionId": transition_id,
+                        "targetAcquisitionMode": target_mode,
+                        "detail": error,
+                        "metadataRollbackError": metadata_rollback.err().map(|item| item.to_string()),
+                        "admissionClosed": true,
+                    })
+                    .to_string(),
+                );
+            }
+            let commit_restored = restore_active_runtime_mode_commit(state, actor);
+            let admission_restored = set_runtime_transition_admission(state, true).is_ok();
+            let rollback_restarted = restart_after_rollback();
+            return http_response(
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({
+                    "code": 500,
+                    "error": "runtime_mode_transition_publish_journal_failed",
+                    "detail": error,
+                    "metadataCommitted": false,
+                    "metadataRolledBack": metadata_rolled_back,
+                    "profilePublished": false,
+                    "commitRestored": commit_restored,
+                    "admissionRestored": admission_restored,
+                    "rollbackRestarted": rollback_restarted,
+                })
+                .to_string(),
+            );
+        }
+        if let Err(error) = write_bytes_atomic(&state.runtime_config.profile_path, &bytes) {
+            if let Some(staged) = staged_profile.as_mut() {
+                staged.retain_for_recovery();
+            }
+            return http_response(
+                "202 Accepted",
+                "application/json; charset=utf-8",
+                &json!({
+                    "saved": true,
+                    "profileId": state.runtime_config.id,
+                    "restartRequired": saved_hash != state.runtime_config.config_hash,
+                    "activeConfigHash": state.runtime_config.config_hash,
+                    "savedConfigHash": saved_hash,
+                    "modeTransitionAccepted": true,
+                    "modeTransitionCommitted": false,
+                    "modeTransitionState": "publish-pending-recovery",
+                    "recoveryRequired": true,
+                    "detail": error,
+                    "metadataCommitted": true,
+                    "transitionRecoverable": true,
+                    "admissionClosed": true,
+                    "transitionId": transition_id,
+                    "targetAcquisitionMode": target_mode,
+                })
+                .to_string(),
+            );
+        }
+    }
+    let release_after_millis = mode_change.then(|| {
+        u64::try_from(current_time_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(
+                u64::try_from(RUNTIME_MODE_TRANSITION_RELEASE_DELAY.as_millis())
+                    .unwrap_or(u64::MAX),
+            )
+    });
+    let commit_state = if mode_change { "ready" } else { "committed" };
+    if let Err(error) = publish_runtime_mode_commit(
+        state,
+        commit_state,
+        target_mode,
+        &saved_hash,
         actor,
-        "save",
-    )) {
-        let _ = write_bytes_atomic(&state.runtime_config.profile_path, &previous);
+        mode_change.then_some(state.runtime_config.acquisition_mode),
+        mode_change.then_some(target_mode),
+        transition_id.as_deref(),
+        release_after_millis,
+        None,
+        staged_profile
+            .as_ref()
+            .map(|staged| staged.relative_path.as_str()),
+    ) {
+        if let Some(staged) = staged_profile.as_mut() {
+            staged.retain_for_recovery();
+        }
         return http_response(
-            "500 Internal Server Error",
+            if mode_change {
+                "202 Accepted"
+            } else {
+                "500 Internal Server Error"
+            },
             "application/json; charset=utf-8",
-            &json!({"code": 500, "error": "runtime_profile_revision_failed", "detail": error.to_string()}).to_string(),
+            &json!({
+                "saved": mode_change,
+                "profileId": state.runtime_config.id,
+                "restartRequired": saved_hash != state.runtime_config.config_hash,
+                "activeConfigHash": state.runtime_config.config_hash,
+                "savedConfigHash": saved_hash,
+                "code": if mode_change { 0 } else { 500 },
+                "error": if mode_change {
+                    Value::Null
+                } else {
+                    json!("runtime_mode_commit_publish_failed")
+                },
+                "modeTransitionAccepted": mode_change,
+                "modeTransitionCommitted": false,
+                "modeTransitionState": if mode_change {
+                    "ready-pending-recovery"
+                } else {
+                    "runtime_mode_commit_publish_failed"
+                },
+                "recoveryRequired": mode_change,
+                "detail": error,
+                "targetPersisted": true,
+                "activeAcquisitionMode": state.runtime_config.acquisition_mode,
+                "targetAcquisitionMode": target_mode,
+                "transitionId": transition_id,
+                "admissionClosed": mode_change,
+            })
+            .to_string(),
         );
     }
-    let _ = state.runtime.block_on(db::append_audit_log(
-        &state.database.connection,
-        actor,
-        "runtime-profile.update",
-        &state.runtime_config.id,
-        "保存运行模式配置；服务重启后生效",
-        "warning",
-    ));
     http_response(
-        "200 OK",
+        if mode_change {
+            "202 Accepted"
+        } else {
+            "200 OK"
+        },
         "application/json; charset=utf-8",
         &json!({
             "saved": true,
@@ -18906,6 +20178,13 @@ fn save_admin_runtime_profile_response(state: &ServiceState, body: &str, actor: 
             "restartRequired": saved_hash != state.runtime_config.config_hash,
             "activeConfigHash": state.runtime_config.config_hash,
             "savedConfigHash": saved_hash,
+            "modeTransitionAccepted": mode_change,
+            "modeTransitionCommitted": !mode_change,
+            "modeTransitionState": if mode_change { "ready" } else { "committed" },
+            "recoveryRequired": false,
+            "transitionId": transition_id,
+            "releaseAfterMillis": release_after_millis,
+            "targetAcquisitionMode": target_mode,
         })
         .to_string(),
     )
@@ -19285,16 +20564,155 @@ fn check_admin_site_config_response(state: &ServiceState, body: &str, actor: &st
     }
 }
 
+fn site_runtime_acquisition_mode(
+    state: &ServiceState,
+    site_id: &str,
+) -> Result<runtime_profile::AcquisitionMode, String> {
+    let package = state.site_configs.get(site_id)?;
+    let path = package.root.join(&package.document.runtime_profile);
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "site runtime profile read failed ({}): {error}",
+            path.display()
+        )
+    })?;
+    let value = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|error| format!("site runtime profile JSON invalid: {error}"))?;
+    state.runtime_config.candidate_acquisition_mode(&value)
+}
+
+fn runtime_commit_preflight_for_site_selection(state: &ServiceState) -> Result<bool, String> {
+    let path = runtime_mode_commit_path(state)?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("runtime mode commit read failed: {error}")),
+    };
+    let marker: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("runtime mode commit JSON invalid: {error}"))?;
+    if marker.get("schema").and_then(Value::as_str) != Some("steel.runtime-mode-commit.v1")
+        || marker.get("state").and_then(Value::as_str) != Some("committed")
+        || marker
+            .get("acquisitionMode")
+            .and_then(Value::as_str)
+            .is_none_or(|mode| {
+                !mode.eq_ignore_ascii_case(state.runtime_config.acquisition_mode.as_str())
+            })
+    {
+        return Err("runtime mode transition is not in a committed state".to_string());
+    }
+    Ok(true)
+}
+
+fn publish_site_selection_runtime_commit(
+    state: &ServiceState,
+    target: &runtime_profile::RuntimeProfile,
+    actor: &str,
+) -> Result<(), String> {
+    let path = runtime_mode_commit_path(state)?;
+    let profile_bytes = fs::read(&target.profile_path)
+        .map_err(|error| format!("selected site runtime profile read failed: {error}"))?;
+    let payload = json!({
+        "schema": "steel.runtime-mode-commit.v1",
+        "state": "committed",
+        "profileId": target.id,
+        "acquisitionMode": target.acquisition_mode,
+        "configHash": target.config_hash,
+        "profileSha256": format!("{:x}", Sha256::digest(&profile_bytes)),
+        "actor": actor,
+        "updatedAt": current_time_millis().to_string(),
+        "committedAt": current_time_millis().to_string(),
+        "reason": "same-mode-site-selection",
+    });
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("site runtime commit serialization failed: {error}"))?;
+    write_bytes_atomic(&path, &bytes)
+}
+
 fn activate_admin_site_config_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     let request: ActivateSiteConfigRequest = match site_config_request(body) {
         Ok(request) => request,
         Err(response) => return response,
+    };
+    let target_mode = match site_runtime_acquisition_mode(state, &request.id) {
+        Ok(mode) => mode,
+        Err(error) => {
+            return site_config_error(
+                "400 Bad Request",
+                "site_config_runtime_profile_invalid",
+                error,
+            )
+        }
+    };
+    if target_mode != state.runtime_config.acquisition_mode {
+        return site_config_error(
+            "409 Conflict",
+            "site_config_acquisition_mode_transition_required",
+            "site selection cannot change acquisitionMode; switch the formal runtime mode first",
+        );
+    }
+    let committed_marker_present = match runtime_commit_preflight_for_site_selection(state) {
+        Ok(present) => present,
+        Err(error) => {
+            return site_config_error(
+                "409 Conflict",
+                "site_config_runtime_transition_active",
+                error,
+            )
+        }
+    };
+    let previous_project = match fs::read(&state.runtime_config.project_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return site_config_error(
+                "500 Internal Server Error",
+                "site_config_project_read_failed",
+                error.to_string(),
+            )
+        }
     };
     match state
         .site_configs
         .activate(&state.runtime_config.project_path, &request.id)
     {
         Ok(selection) => {
+            if committed_marker_present {
+                let allowed_root = state
+                    .runtime_config
+                    .project_path
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| "runtime project path has no allowed root".to_string())
+                    .and_then(|root| {
+                        runtime_profile::RuntimeProfile::load(
+                            &state.runtime_config.project_path,
+                            root,
+                        )
+                    })
+                    .and_then(|target| {
+                        if target.acquisition_mode != state.runtime_config.acquisition_mode {
+                            return Err("selected site changed acquisitionMode after validation"
+                                .to_string());
+                        }
+                        publish_site_selection_runtime_commit(state, &target, actor)
+                    });
+                if let Err(error) = allowed_root {
+                    let rollback =
+                        write_bytes_atomic(&state.runtime_config.project_path, &previous_project);
+                    return site_config_error(
+                        "500 Internal Server Error",
+                        "site_config_runtime_commit_failed",
+                        format!(
+                            "{error}; project rollback {}",
+                            if rollback.is_ok() {
+                                "succeeded"
+                            } else {
+                                "failed"
+                            }
+                        ),
+                    );
+                }
+            }
             append_site_config_audit(
                 state,
                 actor,
@@ -19451,6 +20869,36 @@ fn read_machine_site_selection_response(state: &ServiceState) -> Vec<u8> {
     )
 }
 
+fn machine_site_selection_guard(state: &ServiceState, target_site_id: &str) -> Result<(), Vec<u8>> {
+    let target_mode = site_runtime_acquisition_mode(state, target_site_id).map_err(|error| {
+        site_config_error(
+            "400 Bad Request",
+            "site_config_runtime_profile_invalid",
+            error,
+        )
+    })?;
+    if target_mode != state.runtime_config.acquisition_mode {
+        return Err(site_config_error(
+            "409 Conflict",
+            "site_config_acquisition_mode_transition_required",
+            "machine site selection cannot change acquisitionMode; switch the formal runtime mode first",
+        ));
+    }
+    match runtime_commit_preflight_for_site_selection(state) {
+        Ok(true) if target_site_id != state.runtime_config.site_id => Err(site_config_error(
+            "409 Conflict",
+            "site_config_runtime_commit_conflict",
+            "a committed runtime generation is active; machine default must remain on the running site",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) => Err(site_config_error(
+            "409 Conflict",
+            "site_config_runtime_transition_active",
+            error,
+        )),
+    }
+}
+
 fn set_machine_default_site_response(state: &ServiceState, body: &str, actor: &str) -> Vec<u8> {
     if state.environment_site_id.is_some() {
         return site_config_error(
@@ -19463,6 +20911,9 @@ fn set_machine_default_site_response(state: &ServiceState, body: &str, actor: &s
         Ok(request) => request,
         Err(response) => return response,
     };
+    if let Err(response) = machine_site_selection_guard(state, &request.id) {
+        return response;
+    }
     let report = match state
         .site_configs
         .check(&request.id, site_config::CheckDepth::Default)
@@ -19507,6 +20958,9 @@ fn clear_machine_default_site_response(state: &ServiceState, actor: &str) -> Vec
             "site_config_environment_override_active",
             "machine default cannot change while STEEL_SITE_CONFIG_ID is active",
         );
+    }
+    if let Err(response) = machine_site_selection_guard(state, &state.repository_default_site_id) {
+        return response;
     }
     if let Err(error) = state.machine_site_store.clear_default_site_id() {
         return site_config_error(
@@ -24038,7 +25492,9 @@ fn inspection_record_spec(row: &db::AdminInspectionRecord) -> String {
 }
 
 fn inspection_records_csv(rows: &[db::AdminInspectionRecord]) -> String {
-    let mut csv = String::from("记录号,检测时间,管号,钢种,规格,状态,缺陷总数,严重,待复核,轻微\n");
+    let mut csv = String::from(
+        "记录号,检测时间,管号,钢种,规格,状态,缺陷总数,严重,待复核,轻微,来源模式,来源数据集,来源运行,来源会话,来源内容哈希,回放记录,计入生产验收\n",
+    );
     for row in rows {
         let steel_grade = row
             .session
@@ -24057,6 +25513,13 @@ fn inspection_records_csv(rows: &[db::AdminInspectionRecord]) -> String {
             row.severe_count.to_string(),
             row.review_count.to_string(),
             row.minor_count.to_string(),
+            csv_escape(&row.inspection.source_mode),
+            csv_escape(&row.inspection.source_dataset_id),
+            csv_escape(&row.inspection.source_run_id),
+            csv_escape(&row.inspection.source_session_id),
+            csv_escape(&row.inspection.source_content_hash),
+            row.inspection.replayed.to_string(),
+            row.inspection.production_eligible.to_string(),
         ];
         csv.push_str(&fields.join(","));
         csv.push('\n');
@@ -24095,7 +25558,14 @@ fn inspection_record_json(row: &db::AdminInspectionRecord) -> Value {
         "startedAt": &row.inspection.started_at,
         "finishedAt": &row.inspection.finished_at,
         "summaryPath": &row.inspection.summary_path,
-        "source": "production",
+        "source": if row.inspection.source_mode == "simulation" { "simulation" } else { "production" },
+        "sourceMode": &row.inspection.source_mode,
+        "sourceDatasetId": &row.inspection.source_dataset_id,
+        "sourceRunId": &row.inspection.source_run_id,
+        "sourceSessionId": &row.inspection.source_session_id,
+        "sourceContentHash": &row.inspection.source_content_hash,
+        "replayed": row.inspection.replayed,
+        "productionEligible": row.inspection.production_eligible,
         "plate": plate,
         "severity": {
             "severe": row.severe_count,
@@ -26898,11 +28368,13 @@ fn admin_overview_response(state: &ServiceState) -> Vec<u8> {
                 { "name": "material_session", "label": "生产材料会话", "rows": metrics.material_session_count },
                 { "name": "secondary_data", "label": "二级数据", "rows": metrics.secondary_data_count },
                 { "name": "trigger_event", "label": "生产触发事件", "rows": metrics.trigger_event_count },
-                { "name": "production_inspection", "label": "正式检测记录", "rows": metrics.production_inspection_count },
+                { "name": "production_inspection", "label": "检测记录（全部来源）", "rows": metrics.production_inspection_count },
+                { "name": "production_acceptance_inspection", "label": "生产验收检测记录（排除模拟）", "rows": metrics.production_eligible_inspection_count },
                 { "name": "production_task", "label": "持久生产任务", "rows": metrics.production_task_count },
                 { "name": "calibration_operation", "label": "持久标定操作", "rows": metrics.calibration_operation_count },
                 { "name": "capture_file", "label": "采集文件索引", "rows": metrics.capture_file_count },
-                { "name": "production_defect", "label": "正式缺陷", "rows": metrics.production_defect_count },
+                { "name": "production_defect", "label": "缺陷记录（全部来源）", "rows": metrics.production_defect_count },
+                { "name": "production_acceptance_defect", "label": "生产验收缺陷（排除模拟）", "rows": metrics.production_eligible_defect_count },
                 { "name": "production_alarm", "label": "生产报警", "rows": metrics.production_alarm_count }
             ]
         },
@@ -27339,6 +28811,10 @@ fn handle_client<S: Read + Write>(
             .map(|session| session.user_id.as_str())
             .unwrap_or("anonymous")
     };
+    if let Some(response) = runtime_mode_guard_response_for_request(&state, method, path, body) {
+        let _ = stream.write_all(&response);
+        return;
+    }
     if let Some(response) =
         runtime_capability_guard_response_for_request(&state, method, path, body)
     {
@@ -28200,6 +29676,9 @@ fn main() -> std::io::Result<()> {
         effective_site_selection,
     )
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    validate_runtime_mode_commit_for_startup(&runtime_config)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    db::set_runtime_source_mode(runtime_config.acquisition_mode.as_str());
     let capture_provider = startup_capture_provider(
         &runtime_config,
         env::var("STEEL_RUNTIME_PROFILE").ok().as_deref(),
@@ -28211,6 +29690,8 @@ fn main() -> std::io::Result<()> {
         capture_port,
         capture_provider,
         &runtime_config.capture,
+        runtime_config.acquisition_mode,
+        runtime_config.simulation.as_ref(),
     ));
     let result_proxy_only = result_proxy_only_policy(
         &runtime_config,
@@ -29228,22 +30709,249 @@ mod tests {
     }
 
     #[test]
-    fn development_simulation_override_is_limited_to_direct_camera_sites() {
-        let direct = runtime_profile::RuntimeProfile::test_profile("external-api", 6);
+    fn formal_acquisition_mode_stays_separate_from_development_mock_connection() {
+        let mut direct = runtime_profile::RuntimeProfile::test_profile("external-api", 6);
         assert_eq!(
             startup_capture_provider(&direct, Some("development"), Some("simulated")).unwrap(),
             CaptureProvider::Simulated
         );
+        assert!(startup_capture_provider(&direct, Some("production"), Some("simulated")).is_err());
+        direct.acquisition_mode = runtime_profile::AcquisitionMode::Simulation;
+        assert!(startup_capture_provider(&direct, Some("development"), Some("simulated")).is_err());
         assert_eq!(
-            startup_capture_provider(&direct, Some("production"), Some("simulated")).unwrap(),
+            startup_capture_provider(&direct, Some("development"), None).unwrap(),
             CaptureProvider::ExternalApi
         );
 
         let bkv = runtime_profile::RuntimeProfile::test_profile("bkv", 6);
         assert_eq!(
-            startup_capture_provider(&bkv, Some("development"), Some("simulated")).unwrap(),
+            startup_capture_provider(&bkv, Some("development"), None).unwrap(),
             CaptureProvider::Bkv
         );
+    }
+
+    #[test]
+    fn capture_transition_drain_contract_is_mode_specific_and_queue_safe() {
+        let drained = json!({
+            "serviceState": "stopped",
+            "quiesced": true,
+            "storageQueue": { "pendingRounds": 0, "activeRounds": 0 },
+            "databaseCommit": { "pendingRounds": 0, "activeRounds": 0 }
+        });
+        let mut online = drained.clone();
+        online["historyOnly"] = json!(true);
+        assert!(capture_transition_health_drained(
+            &online,
+            runtime_profile::AcquisitionMode::Online
+        ));
+
+        let mut simulation = drained.clone();
+        simulation["simulation"] = json!({ "state": "paused" });
+        assert!(capture_transition_health_drained(
+            &simulation,
+            runtime_profile::AcquisitionMode::Simulation
+        ));
+        assert!(!capture_transition_health_drained(
+            &simulation,
+            runtime_profile::AcquisitionMode::Online
+        ));
+
+        simulation["storageQueue"]["pendingRounds"] = json!(1);
+        assert!(!capture_transition_health_drained(
+            &simulation,
+            runtime_profile::AcquisitionMode::Simulation
+        ));
+
+        simulation["storageQueue"]["pendingRounds"] = json!(0);
+        simulation["databaseCommit"]["activeRounds"] = json!(1);
+        assert!(!capture_transition_health_drained(
+            &simulation,
+            runtime_profile::AcquisitionMode::Simulation
+        ));
+
+        simulation["databaseCommit"]["activeRounds"] = json!(0);
+        simulation["quiesced"] = json!(false);
+        assert!(!capture_transition_health_drained(
+            &simulation,
+            runtime_profile::AcquisitionMode::Simulation
+        ));
+
+        simulation["quiesced"] = json!(true);
+        simulation["serviceState"] = json!("stopping");
+        assert!(!capture_transition_health_drained(
+            &simulation,
+            runtime_profile::AcquisitionMode::Simulation
+        ));
+
+        for pointer in [
+            "/storageQueue/pendingRounds",
+            "/storageQueue/activeRounds",
+            "/databaseCommit/pendingRounds",
+            "/databaseCommit/activeRounds",
+        ] {
+            let mut incomplete = drained.clone();
+            let (parent, field) = pointer.rsplit_once('/').expect("queue field pointer");
+            incomplete
+                .pointer_mut(parent)
+                .and_then(Value::as_object_mut)
+                .expect("queue object")
+                .remove(field);
+            assert!(
+                !capture_transition_health_drained(
+                    &incomplete,
+                    runtime_profile::AcquisitionMode::Offline
+                ),
+                "missing queue field must not be treated as zero: {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_mode_transition_allows_a_slow_stop_to_flush_before_health_confirmation() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("capture transition listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking capture transition listener");
+        let address = listener.local_addr().expect("capture transition address");
+        let finished = Arc::new(AtomicBool::new(false));
+        let server_finished = Arc::clone(&finished);
+        let server = std::thread::spawn(move || {
+            let mut stopped = false;
+            while !server_finished.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("capture transition accept failed: {error}"),
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut request = [0_u8; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                if size == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&request[..size]);
+                let (status, body) = if request.starts_with("POST /api/service/stop ") {
+                    // Deliberately exceed the ordinary external-api control timeout.
+                    std::thread::sleep(Duration::from_millis(3_200));
+                    stopped = true;
+                    ("200 OK", json!({ "code": 0 }).to_string())
+                } else if request.starts_with("GET /health ") {
+                    (
+                        "200 OK",
+                        json!({
+                            "code": 0,
+                            "historyOnly": stopped,
+                            "serviceState": if stopped { "stopped" } else { "stopping" },
+                            "quiesced": stopped,
+                            "storageQueue": { "pendingRounds": 0, "activeRounds": 0 },
+                            "databaseCommit": { "pendingRounds": 0, "activeRounds": 0 }
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    ("404 Not Found", json!({ "code": 404 }).to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("capture transition response");
+            }
+        });
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            &format!("http://{address}"),
+        );
+
+        let result = state
+            .capture
+            .stop_for_mode_transition(Duration::from_secs(6));
+        finished.store(true, Ordering::Release);
+        server.join().expect("capture transition server");
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn external_mode_transition_rejects_an_accepted_stop_until_queues_are_drained() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("capture transition listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking capture transition listener");
+        let address = listener.local_addr().expect("capture transition address");
+        let finished = Arc::new(AtomicBool::new(false));
+        let server_finished = Arc::clone(&finished);
+        let start_seen = Arc::new(AtomicBool::new(false));
+        let server_start_seen = Arc::clone(&start_seen);
+        let server = std::thread::spawn(move || {
+            while !server_finished.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("capture transition accept failed: {error}"),
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut request = [0_u8; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                if size == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&request[..size]);
+                let (status, body) = if request.starts_with("POST /api/service/stop ") {
+                    ("200 OK", json!({ "code": 0 }).to_string())
+                } else if request.starts_with("POST /api/service/start ") {
+                    server_start_seen.store(true, Ordering::Release);
+                    ("200 OK", json!({ "code": 0 }).to_string())
+                } else if request.starts_with("GET /health ") {
+                    (
+                        "200 OK",
+                        json!({
+                            "code": 0,
+                            "historyOnly": true,
+                            "serviceState": "stopped",
+                            "quiesced": true,
+                            "storageQueue": { "pendingRounds": 1, "activeRounds": 0 },
+                            "databaseCommit": { "pendingRounds": 0, "activeRounds": 0 }
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    ("404 Not Found", json!({ "code": 404 }).to_string())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("capture transition response");
+            }
+        });
+        let state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            &format!("http://{address}"),
+        );
+
+        let result = state
+            .capture
+            .stop_for_mode_transition(Duration::from_millis(300));
+        assert!(result.is_err());
+        let rollback_restarted = state.capture.start();
+        finished.store(true, Ordering::Release);
+        server.join().expect("capture transition server");
+
+        assert!(rollback_restarted);
+        assert!(start_seen.load(Ordering::Acquire));
     }
 
     #[test]
@@ -29278,6 +30986,8 @@ mod tests {
             port: 4317,
             origin: "http://127.0.0.1:4317".to_string(),
             provider: CaptureProvider::HeadlessCpp,
+            acquisition_mode: runtime_profile::AcquisitionMode::Online,
+            simulation: None,
             process: Mutex::new(None),
             lifecycle: Mutex::new(CaptureLifecycleState::with_policy(
                 CaptureProvider::HeadlessCpp,
@@ -29317,9 +31027,9 @@ mod tests {
             production_test_state_with_provider(CaptureProvider::Bkv, "http://127.0.0.1:43179");
         state.capture.supervisor_tick();
         let lifecycle = state.capture.lifecycle.lock().unwrap().clone();
-        assert_eq!(lifecycle.phase, "ready");
-        assert!(lifecycle.desired_running);
-        assert!(lifecycle.autostart);
+        assert_eq!(lifecycle.phase, "offline");
+        assert!(!lifecycle.desired_running);
+        assert!(!lifecycle.autostart);
         assert!(state.capture.process.lock().unwrap().is_none());
     }
 
@@ -29781,6 +31491,17 @@ mod tests {
                 port: capture_port_from_origin(origin).unwrap_or(0),
                 origin: origin.to_string(),
                 provider,
+                acquisition_mode: match provider {
+                    CaptureProvider::Simulated => runtime_profile::AcquisitionMode::Simulation,
+                    CaptureProvider::Bkv => runtime_profile::AcquisitionMode::Offline,
+                    _ => runtime_profile::AcquisitionMode::Online,
+                },
+                simulation: (provider == CaptureProvider::Simulated).then(|| {
+                    runtime_profile::RuntimeSimulation {
+                        source_root: std::env::temp_dir().display().to_string(),
+                        ..runtime_profile::RuntimeSimulation::default()
+                    }
+                }),
                 process: Mutex::new(None),
                 lifecycle: Mutex::new(CaptureLifecycleState::new(provider)),
                 control_allowed: true,
@@ -30086,6 +31807,11 @@ mod tests {
     #[test]
     fn runtime_drain_rejects_new_admission_but_allows_safe_completion() {
         let state = production_test_state();
+        assert!(!runtime_completion_route("POST", "/api/production/tasks"));
+        assert!(runtime_completion_route(
+            "POST",
+            "/api/production/tasks/steel-out"
+        ));
         let first = response_text(production_tasks::enqueue_response(
             &state,
             r#"{"kind":"steel-in","idempotencyKey":"DRAIN-REPLAY","payload":{"materialId":"MAT-DRAIN"}}"#,
@@ -30123,6 +31849,15 @@ mod tests {
         match rejected_admission {
             Err(response) => assert!(response_text(response).contains("runtime_draining")),
             Ok(_) => panic!("new production admission must be rejected while draining"),
+        }
+        for (method, path) in [
+            ("PUT", "/api/admin/algorithm/depth-geometry"),
+            ("PATCH", "/api/admin/site-configs"),
+        ] {
+            match enter_runtime_admission(&state, method, path) {
+                Err(response) => assert!(response_text(response).contains("runtime_draining")),
+                Ok(_) => panic!("{method} mutation must be rejected while draining: {path}"),
+            }
         }
         let completion = enter_runtime_admission(&state, "POST", "/api/production/steel-out")
             .expect("steel-out admission")
@@ -30266,7 +32001,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.body["checks"]["capture"]["status"],
-            json!("simulated")
+            json!("simulation")
         );
 
         let response = response_text(service_health_response(&state, HealthEndpoint::Ready));
@@ -30274,6 +32009,89 @@ mod tests {
         assert!(!response.contains("simulated://capture"));
         assert!(!response.contains("lastError"));
         assert!(!response.contains("executable"));
+    }
+
+    #[test]
+    fn offline_health_disables_new_work_dependencies_without_false_system_alarms() {
+        let mut state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            "http://127.0.0.1:0/unreachable-physical-capture",
+        );
+        Arc::make_mut(&mut state.runtime_config).acquisition_mode =
+            runtime_profile::AcquisitionMode::Offline;
+
+        let snapshot = service_health_snapshot(&state);
+
+        assert!(snapshot.ready);
+        assert_eq!(snapshot.body["acquisitionMode"], json!("offline"));
+        assert_eq!(
+            snapshot.body["checks"]["taskWorker"]["status"],
+            json!("offline-not-required")
+        );
+        assert_eq!(
+            snapshot.body["checks"]["capture"]["status"],
+            json!("offline")
+        );
+        assert_eq!(snapshot.body["checks"]["capture"]["sdkRequired"], false);
+        assert_eq!(snapshot.body["checks"]["capture"]["sdkReady"], Value::Null);
+        assert_eq!(
+            snapshot.body["checks"]["capture"]["physicalCamerasOnline"],
+            0
+        );
+        assert_eq!(
+            snapshot.body["checks"]["storage"]["status"],
+            json!("history-read-only")
+        );
+        assert_eq!(
+            snapshot.body["checks"]["trigger"]["status"],
+            json!("mode-not-required")
+        );
+        assert_eq!(
+            snapshot.body["checks"]["algorithm"]["status"],
+            json!("offline-not-required")
+        );
+        assert!(system_health_alarm_specs(&snapshot.body).is_empty());
+    }
+
+    #[test]
+    fn simulation_health_uses_external_replay_contract_without_requiring_sdk() {
+        let body = json!({
+            "ready": true,
+            "providerReady": true,
+            "simulation": {
+                "sourceAvailable": true,
+                "channels": ["C1", "C2", "C3"],
+                "state": "paused",
+                "sourceDatasetId": "dataset-usb-001",
+                "currentSessionId": "session-002",
+                "progress": 0.25
+            }
+        })
+        .to_string();
+        let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
+        let mut state = production_test_state_with_provider(CaptureProvider::ExternalApi, &origin);
+        let profile = Arc::make_mut(&mut state.runtime_config);
+        profile.acquisition_mode = runtime_profile::AcquisitionMode::Simulation;
+        profile.simulation = Some(runtime_profile::RuntimeSimulation {
+            source_root: std::env::temp_dir().display().to_string(),
+            ..runtime_profile::RuntimeSimulation::default()
+        });
+
+        let (ok, detail) = capture_health_component(&state);
+        server.join().expect("simulation health server");
+
+        assert!(ok);
+        assert_eq!(detail["status"], json!("simulation"));
+        assert_eq!(detail["provider"], json!("external-api"));
+        assert_eq!(detail["sourceReady"], true);
+        assert_eq!(detail["sdkRequired"], false);
+        assert_eq!(detail["sdkReady"], Value::Null);
+        assert_eq!(detail["replayChannels"], json!(["C1", "C2", "C3"]));
+        assert_eq!(detail["simulationChannelCount"], json!(3));
+        assert_eq!(detail["replayState"], json!("paused"));
+        assert_eq!(detail["datasetId"], json!("dataset-usb-001"));
+        assert_eq!(detail["currentSession"], json!("session-002"));
+        assert_eq!(detail["progress"], json!(0.25));
     }
 
     #[test]
@@ -30768,6 +32586,8 @@ mod tests {
         slow_server.join().expect("slow trigger health server");
 
         let mut unavailable_state = production_test_state();
+        Arc::make_mut(&mut unavailable_state.runtime_config).acquisition_mode =
+            runtime_profile::AcquisitionMode::Online;
         mark_task_worker_healthy(&unavailable_state);
         unavailable_state.trigger_health_required = true;
         unavailable_state.trigger_gateway_origin = unused_local_http_origin();
@@ -30790,6 +32610,8 @@ mod tests {
         .to_string();
         let (origin, server) = spawn_health_http_server("200 OK", body, Duration::ZERO);
         let mut available_state = production_test_state();
+        Arc::make_mut(&mut available_state.runtime_config).acquisition_mode =
+            runtime_profile::AcquisitionMode::Online;
         mark_task_worker_healthy(&available_state);
         available_state.trigger_health_required = true;
         available_state.trigger_gateway_origin = origin;
@@ -31948,6 +33770,12 @@ mod tests {
         assert_eq!(saved["saved"], true);
         assert_eq!(saved["profileId"], "bkv-6");
         assert_eq!(saved["restartRequired"], true);
+        assert_eq!(saved["modeTransitionAccepted"], false);
+        assert_eq!(saved["modeTransitionCommitted"], true);
+        assert_eq!(saved["modeTransitionState"], "committed");
+        assert_eq!(saved["recoveryRequired"], false);
+        assert_eq!(saved["targetAcquisitionMode"], "offline");
+        assert!(saved["transitionId"].is_null());
         assert_eq!(
             state.runtime_config.display_name, "BKV 六相机离线转换",
             "active runtime must not hot reload"
@@ -31970,7 +33798,307 @@ mod tests {
             )))
             .expect("audit query");
         assert!(audit.is_some());
+        let marker: Value = serde_json::from_slice(
+            &fs::read(root.join(RUNTIME_MODE_COMMIT_RELATIVE_PATH))
+                .expect("same-mode commit marker"),
+        )
+        .expect("same-mode commit marker JSON");
+        assert_eq!(marker["state"], json!("committed"));
+        let saved_bytes = fs::read(&state.runtime_config.profile_path).expect("saved profile");
+        assert_eq!(
+            marker["profileSha256"],
+            json!(format!("{:x}", Sha256::digest(&saved_bytes)))
+        );
         fs::remove_dir_all(root).expect("remove runtime fixture");
+    }
+
+    #[test]
+    fn startup_rejects_unreleased_or_mismatched_mode_transition_markers() {
+        let (root, loaded, _) = admin_runtime_profile_fixture();
+        let marker_path = root.join(RUNTIME_MODE_COMMIT_RELATIVE_PATH);
+        let profile_bytes = fs::read(&loaded.profile_path).expect("profile bytes");
+        let profile_sha256 = format!("{:x}", Sha256::digest(&profile_bytes));
+        let marker = |state: &str, release_after: Option<u64>| {
+            let mut marker = json!({
+                "schema": "steel.runtime-mode-commit.v1",
+                "state": state,
+                "acquisitionMode": "offline",
+                "profileSha256": profile_sha256,
+            });
+            if let Some(release_after) = release_after {
+                marker["releaseAfterMillis"] = json!(release_after);
+            }
+            marker
+        };
+        fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker("committed", None)).expect("committed marker"),
+        )
+        .expect("committed marker");
+        validate_runtime_mode_commit_for_startup(&loaded).expect("matching committed marker");
+
+        fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker(
+                "ready",
+                Some(u64::try_from(current_time_millis()).unwrap_or(u64::MAX) + 60_000),
+            ))
+            .expect("ready marker"),
+        )
+        .expect("ready marker");
+        assert!(validate_runtime_mode_commit_for_startup(&loaded).is_err());
+
+        fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker("ready", Some(0))).expect("released marker"),
+        )
+        .expect("released marker");
+        validate_runtime_mode_commit_for_startup(&loaded).expect("released marker");
+
+        let mut changed = profile_bytes;
+        changed.push(b'\n');
+        fs::write(&loaded.profile_path, changed).expect("changed profile bytes");
+        assert!(validate_runtime_mode_commit_for_startup(&loaded).is_err());
+        fs::remove_dir_all(root).expect("remove marker fixture");
+    }
+
+    #[test]
+    fn failed_mode_change_audit_restores_profile_and_restarts_previous_capture() {
+        let (root, mut loaded, profile) = admin_runtime_profile_fixture();
+        loaded.acquisition_mode = runtime_profile::AcquisitionMode::Online;
+        loaded.provider = "external-api".to_string();
+        let original = fs::read(&loaded.profile_path).expect("original runtime profile");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("capture lifecycle listener");
+        let address = listener.local_addr().expect("capture lifecycle address");
+        let start_seen = Arc::new(AtomicBool::new(false));
+        let server_start_seen = Arc::clone(&start_seen);
+        let server = std::thread::spawn(move || {
+            let mut running = true;
+            loop {
+                let (mut stream, _) = listener.accept().expect("capture lifecycle connection");
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut request = [0_u8; 2048];
+                let size = stream.read(&mut request).unwrap_or(0);
+                if size == 0 {
+                    if server_start_seen.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&request[..size]);
+                let (status, body, finish_after_response) =
+                    if request.starts_with("POST /api/service/stop ") {
+                        running = false;
+                        ("200 OK", json!({ "code": 0 }).to_string(), false)
+                    } else if request.starts_with("POST /api/service/start ") {
+                        running = true;
+                        server_start_seen.store(true, Ordering::Release);
+                        ("200 OK", json!({ "code": 0 }).to_string(), false)
+                    } else if request.starts_with("GET /health ") {
+                        let after_restart = server_start_seen.load(Ordering::Acquire);
+                        (
+                            "200 OK",
+                            json!({
+                                "ready": running,
+                                "providerReady": running,
+                                "historyOnly": !running,
+                                "serviceState": if running { "running" } else { "stopped" },
+                                "quiesced": !running,
+                                "storageQueue": { "pendingRounds": 0, "activeRounds": 0 },
+                                "databaseCommit": { "pendingRounds": 0, "activeRounds": 0 }
+                            })
+                            .to_string(),
+                            after_restart,
+                        )
+                    } else {
+                        ("404 Not Found", json!({ "code": 404 }).to_string(), false)
+                    };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("capture lifecycle response");
+                if finish_after_response {
+                    break;
+                }
+            }
+        });
+
+        let mut state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            &format!("http://{address}"),
+        );
+        state.runtime_config = Arc::new(loaded);
+        install_failing_insert_trigger(&state, "audit_log");
+
+        let response = response_text(save_admin_runtime_profile_response(
+            &state,
+            &json!({ "profile": profile }).to_string(),
+            "admin",
+        ));
+        server.join().expect("capture lifecycle server");
+
+        assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(response.contains("runtime_profile_audit_failed"));
+        assert!(response.contains("\"rollbackRestarted\":true"));
+        assert!(start_seen.load(Ordering::Acquire));
+        assert_eq!(
+            fs::read(&state.runtime_config.profile_path).expect("rolled back runtime profile"),
+            original
+        );
+        assert!(state
+            .runtime
+            .block_on(db::list_config_revisions(
+                &state.database.connection,
+                Some("runtime-profile".to_string()),
+                10,
+            ))
+            .expect("rolled back runtime profile revisions")
+            .is_empty());
+        fs::remove_dir_all(root).expect("remove audit rollback fixture");
+    }
+
+    #[test]
+    fn acquisition_mode_change_does_not_publish_when_capture_stop_is_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "steel-runtime-mode-stop-rejected-{}-{}",
+            std::process::id(),
+            current_time_millis()
+        ));
+        let profile_path = root.join("config/runtime-modes/direct-6.json");
+        let capture_path = root.join("config/capture/profile.json");
+        let project_path = root.join("config/project.json");
+        let cti_path = root.join("vendor/SICKGigEVisionTL.cti");
+        fs::create_dir_all(profile_path.parent().expect("profile parent"))
+            .expect("runtime profile directory");
+        fs::create_dir_all(capture_path.parent().expect("capture parent"))
+            .expect("capture profile directory");
+        fs::create_dir_all(cti_path.parent().expect("CTI parent")).expect("CTI fixture directory");
+        let cti_bytes = b"fixture SICK GenTL producer";
+        fs::write(&cti_path, cti_bytes).expect("CTI fixture");
+        let cti_sha256 = format!("{:x}", Sha256::digest(cti_bytes));
+        let profile = json!({
+            "schema": "steel.runtime-profile.v1",
+            "id": "direct-6",
+            "displayName": "direct online",
+            "acquisitionMode": "online",
+            "provider": "external-api",
+            "dataSource": "online-production",
+            "cameraConnection": "headless-cpp",
+            "cameraCount": 6,
+            "captureProfile": "config/capture/profile.json",
+            "cameras": (1..=6).map(|camera| json!({
+                "id": format!("C{camera}"),
+                "displayOrder": camera,
+                "sourceCameraId": camera,
+                "role": format!("array-{camera}")
+            })).collect::<Vec<_>>(),
+            "storage": {},
+            "capture": { "enabled": true, "autostart": true },
+            "capabilities": {
+                "directCamera": true,
+                "captureManagement": true,
+                "reconstruction": true,
+                "offlineReplay": false
+            }
+        });
+        fs::write(
+            &project_path,
+            serde_json::to_vec(&json!({
+                "schema": "steel.project-config.v1",
+                "activeRuntimeProfile": "config/runtime-modes/direct-6.json"
+            }))
+            .expect("project json"),
+        )
+        .expect("project fixture");
+        let original = serde_json::to_vec_pretty(&profile).expect("profile json");
+        fs::write(&profile_path, &original).expect("profile fixture");
+        fs::write(
+            &capture_path,
+            serde_json::to_vec(&json!({
+                "schema": "steel.capture.profile.v1",
+                "driverMode": "sick-gentl",
+                "sick": {
+                    "ctiPath": cti_path.display().to_string(),
+                    "ctiSha256": cti_sha256
+                },
+                "expectedCameras": 6,
+                "cameras": (1..=6).map(|camera| json!({
+                    "cameraIndex": camera,
+                    "enabled": true
+                })).collect::<Vec<_>>()
+            }))
+            .expect("capture json"),
+        )
+        .expect("capture fixture");
+        let loaded = runtime_profile::RuntimeProfile::load(&project_path, &root)
+            .expect("online runtime profile");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("capture stop listener");
+        let address = listener.local_addr().expect("capture stop address");
+        let start_seen = Arc::new(AtomicBool::new(false));
+        let server_start_seen = Arc::clone(&start_seen);
+        let server = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().expect("capture stop connection");
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut request = [0_u8; 2048];
+            let size = stream.read(&mut request).unwrap_or(0);
+            if size == 0 {
+                continue;
+            }
+            let request = String::from_utf8_lossy(&request[..size]);
+            if request.starts_with("POST /api/service/stop ") {
+                let body = r#"{"code":409,"error":"capture_busy"}"#;
+                let response = format!(
+                    "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("capture stop rejection");
+            } else if request.starts_with("POST /api/service/start ") {
+                let body = r#"{"code":0}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("capture rollback start");
+                server_start_seen.store(true, Ordering::Release);
+                break;
+            }
+        });
+        let mut state = production_test_state_with_provider(
+            CaptureProvider::ExternalApi,
+            &format!("http://{address}"),
+        );
+        state.runtime_config = Arc::new(loaded);
+        let mut offline = profile;
+        offline["acquisitionMode"] = json!("offline");
+
+        let response = response_text(save_admin_runtime_profile_response(
+            &state,
+            &json!({ "profile": offline }).to_string(),
+            "admin",
+        ));
+        server.join().expect("capture stop server");
+
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(response.contains("runtime_mode_transition_capture_stop_failed"));
+        assert!(response.contains("\"rollbackRestarted\":true"));
+        assert!(start_seen.load(Ordering::Acquire));
+        assert_eq!(
+            fs::read(&profile_path).expect("unchanged profile"),
+            original
+        );
+        fs::remove_dir_all(root).expect("remove mode transition fixture");
     }
 
     #[test]
@@ -32146,6 +34274,91 @@ mod tests {
         assert!(sites
             .iter()
             .any(|site| site["id"] == "bkv-next" && site["pending"] == true));
+        fs::remove_dir_all(root).expect("remove site fixture");
+    }
+
+    #[test]
+    fn admin_site_selection_cannot_bypass_the_formal_acquisition_mode_transition() {
+        let (root, mut state) = admin_site_config_fixture();
+        state.repository_default_site_id = "bkv-current".to_string();
+        state
+            .site_configs
+            .create(site_config::CreateSiteConfig {
+                id: "direct-next".to_string(),
+                display_name: "直连下一现场".to_string(),
+                mode: site_config::SiteMode::DirectCamera,
+            })
+            .expect("direct target site");
+        let project_before =
+            fs::read(&state.runtime_config.project_path).expect("project before selection");
+
+        let activated = response_text(activate_admin_site_config_response(
+            &state,
+            &json!({"id": "direct-next"}).to_string(),
+            "admin",
+        ));
+        assert!(activated.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(activated.contains("site_config_acquisition_mode_transition_required"));
+        assert_eq!(
+            fs::read(&state.runtime_config.project_path).expect("project after rejection"),
+            project_before
+        );
+
+        let machine_default = response_text(set_machine_default_site_response(
+            &state,
+            &json!({"id": "direct-next"}).to_string(),
+            "admin",
+        ));
+        assert!(machine_default.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(machine_default.contains("site_config_acquisition_mode_transition_required"));
+        assert_eq!(
+            state
+                .machine_site_store
+                .read_default_site_id()
+                .expect("machine store"),
+            None
+        );
+        fs::remove_dir_all(root).expect("remove site fixture");
+    }
+
+    #[test]
+    fn same_mode_site_activation_advances_the_committed_profile_hash() {
+        let (root, state) = admin_site_config_fixture();
+        state
+            .site_configs
+            .create(site_config::CreateSiteConfig {
+                id: "bkv-next".to_string(),
+                display_name: "BKV 下一现场".to_string(),
+                mode: site_config::SiteMode::Bkv,
+            })
+            .expect("next site");
+        publish_runtime_mode_commit(
+            &state,
+            "committed",
+            state.runtime_config.acquisition_mode,
+            &state.runtime_config.config_hash,
+            "admin",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("initial runtime commit");
+
+        let activated = response_json(activate_admin_site_config_response(
+            &state,
+            &json!({"id": "bkv-next"}).to_string(),
+            "admin",
+        ));
+        assert_eq!(activated["pendingSiteId"], "bkv-next");
+        let target =
+            runtime_profile::RuntimeProfile::load(&state.runtime_config.project_path, &root)
+                .expect("selected target runtime");
+        assert_eq!(target.site_id, "bkv-next");
+        validate_runtime_mode_commit_for_startup(&target)
+            .expect("commit marker must match the selected profile");
         fs::remove_dir_all(root).expect("remove site fixture");
     }
 
@@ -32414,6 +34627,156 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_mode_guard_blocks_new_work_without_blocking_history_mutations() {
+        let offline =
+            production_test_state_with_provider(CaptureProvider::Bkv, "http://127.0.0.1:0");
+        let blocked =
+            runtime_mode_guard_response_for_request(&offline, "POST", "/api/capture/start", "{}")
+                .expect("offline capture must be blocked");
+        let blocked = response_text(blocked);
+        assert!(blocked.starts_with("HTTP/1.1 409 Conflict"));
+        assert!(blocked.contains("\"error\":\"mode_offline\""));
+        let retry = runtime_mode_guard_response_for_request(
+            &offline,
+            "POST",
+            "/api/production/tasks/retry",
+            "{}",
+        )
+        .expect("offline task retry must be blocked");
+        assert!(response_text(retry).contains("\"error\":\"mode_offline\""));
+        for kind in [
+            "capture",
+            "capture_once",
+            "algorithm",
+            "algorithm_run",
+            "steelinfo",
+            "info",
+            "steelin",
+            "in",
+            "steelout",
+            "out",
+            "triggerevent",
+            "event",
+        ] {
+            let body = json!({ "kind": kind }).to_string();
+            let response = runtime_mode_guard_response_for_request(
+                &offline,
+                "POST",
+                "/api/production/tasks",
+                &body,
+            )
+            .expect("every normalized task alias must be mode guarded");
+            assert!(
+                response_text(response).contains("\"error\":\"mode_offline\""),
+                "unguarded task alias: {kind}"
+            );
+        }
+        for path in [
+            "/api/steel/event",
+            "/api/trigger/manual/steel-in",
+            "/api/config/profile/apply",
+        ] {
+            let response = runtime_mode_guard_response_for_request(&offline, "POST", path, "{}")
+                .expect("offline acquisition mutation must be guarded");
+            assert!(response_text(response).contains("\"error\":\"mode_offline\""));
+        }
+        assert!(runtime_mode_guard_response_for_request(
+            &offline,
+            "POST",
+            "/api/defects/review",
+            "{}"
+        )
+        .is_none());
+        assert!(runtime_mode_guard_response_for_request(
+            &offline,
+            "POST",
+            "/api/production/tasks/cancel",
+            "{}"
+        )
+        .is_none());
+        assert!(runtime_mode_guard_response_for_request(
+            &offline,
+            "POST",
+            "/api/bkv/replay/next",
+            "{}"
+        )
+        .is_none());
+
+        let simulation = production_test_state();
+        let physical = runtime_mode_guard_response_for_request(
+            &simulation,
+            "POST",
+            "/api/camera/connect-all",
+            "{}",
+        )
+        .expect("simulation physical camera operation must be blocked");
+        assert!(response_text(physical)
+            .contains("\"error\":\"mode_simulation_physical_operation_forbidden\""));
+        for path in ["/api/config/capture", "/api/capture/continuous-test"] {
+            let response = runtime_mode_guard_response_for_request(&simulation, "POST", path, "{}")
+                .expect("simulation physical configuration must be blocked");
+            assert!(response_text(response)
+                .contains("\"error\":\"mode_simulation_physical_operation_forbidden\""));
+        }
+        for path in [
+            "/api/config/profile/apply",
+            "/api/trigger/manual/steel-in",
+            "/api/steel/event",
+        ] {
+            let response = runtime_mode_guard_response_for_request(&simulation, "POST", path, "{}")
+                .expect("simulation physical operation must be blocked");
+            assert!(response_text(response)
+                .contains("\"error\":\"mode_simulation_physical_operation_forbidden\""));
+        }
+        let manual_flow = runtime_mode_guard_response_for_request(
+            &simulation,
+            "POST",
+            "/api/production/steel-in",
+            "{}",
+        )
+        .expect("simulation manual production flow must use replay control");
+        assert!(response_text(manual_flow)
+            .contains("\"error\":\"mode_simulation_replay_control_required\""));
+        assert!(runtime_mode_guard_response_for_request(
+            &simulation,
+            "POST",
+            "/internal/v1/capture-commit",
+            "{}"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn simulation_proxy_endpoints_require_simulation_mode() {
+        let online =
+            production_test_state_with_provider(CaptureProvider::ExternalApi, "http://127.0.0.1:0");
+        for (method, path) in [
+            ("GET", "/api/capture/simulation/status"),
+            ("POST", "/api/capture/simulation/control"),
+        ] {
+            let response = runtime_mode_guard_response_for_request(&online, method, path, "{}")
+                .expect("online mode must reject simulation endpoint");
+            assert!(response_text(response).contains("\"error\":\"mode_online\""));
+        }
+
+        let simulation = production_test_state();
+        assert!(runtime_mode_guard_response_for_request(
+            &simulation,
+            "GET",
+            "/api/capture/simulation/status",
+            ""
+        )
+        .is_none());
+        assert!(runtime_mode_guard_response_for_request(
+            &simulation,
+            "POST",
+            "/api/capture/simulation/control",
+            r#"{"action":"pause"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
     fn latest_capture_metadata_is_read_through_the_rust_proxy() {
         assert!(is_capture_json_proxy_route("GET", "/api/capture/logs"));
         assert!(is_capture_json_proxy_route("GET", "/api/capture/latest"));
@@ -32464,6 +34827,18 @@ mod tests {
             "GET",
             "/api/capture/continuous-settings"
         ));
+        assert!(is_capture_json_proxy_route(
+            "GET",
+            "/api/capture/simulation/status"
+        ));
+        assert!(is_capture_json_proxy_route(
+            "POST",
+            "/api/capture/simulation/control"
+        ));
+        assert_eq!(
+            permission_for_route("POST", "/api/capture/simulation/control"),
+            Some("admin.services")
+        );
     }
 
     #[test]
@@ -35481,6 +37856,13 @@ mod tests {
             finished_at: "2000".to_string(),
             capture_count: 0,
             defect_count: 1,
+            source_mode: "legacy_unknown".to_string(),
+            source_dataset_id: String::new(),
+            source_run_id: String::new(),
+            source_session_id: String::new(),
+            source_content_hash: String::new(),
+            replayed: false,
+            production_eligible: true,
             raw_payload: "{}".to_string(),
         };
         let plate = json!({
@@ -37298,6 +39680,13 @@ mod tests {
             finished_at: String::new(),
             capture_count: 1,
             defect_count: 0,
+            source_mode: "legacy_unknown".to_string(),
+            source_dataset_id: String::new(),
+            source_run_id: String::new(),
+            source_session_id: String::new(),
+            source_content_hash: String::new(),
+            replayed: false,
+            production_eligible: true,
             raw_payload: "{}".to_string(),
         };
 
@@ -37334,6 +39723,13 @@ mod tests {
             finished_at: String::new(),
             capture_count: 1,
             defect_count: 0,
+            source_mode: "legacy_unknown".to_string(),
+            source_dataset_id: String::new(),
+            source_run_id: String::new(),
+            source_session_id: String::new(),
+            source_content_hash: String::new(),
+            replayed: false,
+            production_eligible: true,
             raw_payload: "{}".to_string(),
         };
         let roots = vec![

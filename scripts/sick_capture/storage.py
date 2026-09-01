@@ -155,6 +155,8 @@ class FrameWriteResult:
     write_bytes: int = 0
 
     def provider_row(self, frame: RawFrame, round_index: int) -> dict[str, Any]:
+        provenance = dict(frame.provenance or {})
+        replayed = bool(provenance.get("replayed", False))
         return {
             "code": 0,
             "errorName": "CORRECT",
@@ -192,6 +194,19 @@ class FrameWriteResult:
             "frameTransaction": True,
             "metadataCommitLast": True,
             "checksums": self.checksums,
+            "runtimeMode": str(provenance.get("runtimeMode", "online")),
+            "sourceMode": str(
+                provenance.get("sourceMode", provenance.get("runtimeMode", "online"))
+            ),
+            "sourceDatasetId": provenance.get("sourceDatasetId"),
+            "sourceRunId": provenance.get("sourceRunId"),
+            "sourceSessionId": provenance.get("sourceSessionId"),
+            "sourceContentHash": provenance.get("sourceContentHash"),
+            "sourceFrameContentHash": provenance.get("sourceFrameContentHash"),
+            "replayed": replayed,
+            "physicalCapture": bool(provenance.get("physicalCapture", not replayed)),
+            "synthetic": bool(provenance.get("synthetic", False)),
+            "sourceProvenance": provenance or None,
         }
 
 
@@ -381,6 +396,24 @@ class DualFormatWriter:
             frame.host_utc_ns / 1_000_000_000,
             tz=timezone.utc,
         ).strftime("%Y-%m-%d %H:%M:%S:%f")
+        source_provenance = dict(frame.provenance or {})
+        replayed = bool(source_provenance.get("replayed", False))
+        runtime_mode = str(source_provenance.get("runtimeMode", "online"))
+        source_mode = str(source_provenance.get("sourceMode", runtime_mode))
+        physical_capture = bool(
+            source_provenance.get("physicalCapture", not replayed)
+        )
+        synthetic = bool(source_provenance.get("synthetic", False))
+        source_identity = {
+            "sourceMode": source_mode,
+            "sourceDatasetId": source_provenance.get("sourceDatasetId"),
+            "sourceRunId": source_provenance.get("sourceRunId"),
+            "sourceSessionId": source_provenance.get("sourceSessionId"),
+            "sourceContentHash": source_provenance.get("sourceContentHash"),
+            "sourceFrameContentHash": source_provenance.get(
+                "sourceFrameContentHash"
+            ),
+        }
         legacy_metadata = {
             "timestamp": frame.timestamp,
             "timestamp_frequency": frame.timestamp_frequency,
@@ -413,6 +446,12 @@ class DualFormatWriter:
             "frameTriggerMode": frame.frame_trigger_mode,
             "triggerIssuedNs": frame.trigger_issued_ns,
             "triggerCompletedNs": frame.trigger_completed_ns,
+            "runtimeMode": runtime_mode,
+            **source_identity,
+            "replayed": replayed,
+            "physicalCapture": physical_capture,
+            "synthetic": synthetic,
+            "sourceProvenance": source_provenance or None,
             "checksums": checksums,
         }
         calibration = self.artifact_context.get("calibration", {})
@@ -423,8 +462,12 @@ class DualFormatWriter:
         )
         frame_artifact = {
             "schema": "steel.frame-artifact.v1",
-            "physicalCapture": True,
-            "synthetic": False,
+            "physicalCapture": physical_capture,
+            "synthetic": synthetic,
+            "replayed": replayed,
+            "runtimeMode": runtime_mode,
+            **source_identity,
+            "sourceProvenance": source_provenance or None,
             "inspectionId": inspection_id,
             "materialId": material_id,
             "sessionId": session_id,

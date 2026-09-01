@@ -14,6 +14,7 @@ import { CaptureSurfacePanel } from './CaptureSurfacePanel';
 
 interface CapturePlaybackProps {
   statuses: CaptureCameraStatus[];
+  simulation?: boolean;
 }
 
 function cameraLabel(status: CaptureCameraStatus, index: number) {
@@ -57,7 +58,7 @@ function playbackImageSize(saved: CaptureHistoryCameraFrame, roi: [number, numbe
   };
 }
 
-export function CapturePlayback({ statuses }: CapturePlaybackProps) {
+export function CapturePlayback({ statuses, simulation = false }: CapturePlaybackProps) {
   const cameras = useMemo(
     () => statuses.filter((status) => status.enabled !== false),
     [statuses],
@@ -208,7 +209,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
       </header>
 
       {frame ? (
-        <div className="capture-playback-grid" aria-label="历史六相机画面">
+        <div className="capture-playback-grid" aria-label={simulation ? '历史模拟通道画面' : '历史六相机画面'}>
           {cameras.map((camera, index) => {
             const saved = frame.cameras.find((item) => (
               readyPlaybackRoi(item) !== null
@@ -222,7 +223,7 @@ export function CapturePlayback({ statuses }: CapturePlaybackProps) {
             const size = saved && roi ? playbackImageSize(saved, roi) : null;
             return (
               <article key={camera.ip} className="capture-playback-card">
-                <header><b>{label}</b><span>{camera.ip}</span></header>
+                <header><b>{label}</b><span>{simulation ? '模拟数据回放' : camera.ip}</span></header>
                 <div>
                   {saved && roi && size ? (
                     <img

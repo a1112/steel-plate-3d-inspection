@@ -47,6 +47,8 @@ from .playback import (
     write_flow_pyramid_cache_status,
 )
 from .profile import CameraProfile, SickCaptureProfile, load_profile, sha256_file
+from .replay import LG3DReplayBackend, ReplayCompleted
+from .runtime_mode import NullCaptureBackend, RuntimeMode, normalize_runtime_mode
 from .renditions import (
     build_gray_rendition,
     build_jet_rendition,
@@ -543,10 +545,33 @@ class ProviderRuntime:
         backend: Any | None = None,
         writer: DualFormatWriter | None = None,
         history_only: bool = False,
+        runtime_mode: str | None = None,
+        simulation_source: Path | str | None = None,
+        simulation_speed: float = 1.0,
+        simulation_loop: bool = False,
+        simulation_session_gap_ms: int = 1_500,
     ) -> None:
         self.profile = profile
-        self.history_only = history_only
-        self.backend = backend or SickGenTLBackend(profile)
+        self.runtime_mode: RuntimeMode = normalize_runtime_mode(
+            runtime_mode, history_only=history_only
+        )
+        self.history_only = self.runtime_mode == "offline"
+        if backend is not None:
+            self.backend = backend
+        elif self.runtime_mode == "online":
+            self.backend = SickGenTLBackend(profile)
+        elif self.runtime_mode == "offline":
+            self.backend = NullCaptureBackend()
+        else:
+            if simulation_source is None or not str(simulation_source).strip():
+                raise ValueError("simulation mode requires a simulation source root")
+            self.backend = LG3DReplayBackend(
+                profile,
+                simulation_source,
+                speed=simulation_speed,
+                loop=simulation_loop,
+                session_gap_ms=simulation_session_gap_ms,
+            )
         artifact_context = _frame_artifact_context(profile)
         self.writer = writer or DualFormatWriter(
             jpeg_quality=profile.jpeg_quality,
@@ -751,6 +776,10 @@ class ProviderRuntime:
             ),
             False,
         )
+        if self.runtime_mode == "simulation":
+            # Replay has authoritative source-session boundaries. Camera-local
+            # grayscale debounce would split or merge those sessions again.
+            self.per_camera_flow_routing = False
         self.camera_material_signal_ratio = max(
             0.0001,
             min(
@@ -999,7 +1028,7 @@ class ProviderRuntime:
         )
         self.storage_queue_lock = threading.RLock()
         self.storage_queue_space = threading.Condition(self.storage_queue_lock)
-        self.storage_queue_accepting = True
+        self.storage_queue_accepting = self.runtime_mode != "offline"
         self.storage_queue_pending_rounds = 0
         self.storage_queue_pending_by_material: dict[str, int] = {}
         self.storage_queue_active_rounds = 0
@@ -1028,10 +1057,19 @@ class ProviderRuntime:
         self.last_connection_code: int | None = None
         self.acquisition_stop = threading.Event()
         self.acquisition_thread: threading.Thread | None = None
+        self.acquisition_generation = 0
         self.service_transition_lock = threading.RLock()
         self.service_start_thread: threading.Thread | None = None
         self.service_stop_thread: threading.Thread | None = None
-        self.service_state = "stopped" if history_only else "running"
+        self.service_state = (
+            "offline"
+            if self.runtime_mode == "offline"
+            else "idle"
+            if self.runtime_mode == "simulation"
+            else "running"
+        )
+        self.simulation_active_absolute_session = -1
+        self.simulation_output_flows: dict[int, tuple[str, str]] = {}
         self.continuous_round = 0
         self.continuous_acquisition_frame_count = 0
         self.continuous_discarded_frame_count = 0
@@ -1309,7 +1347,7 @@ class ProviderRuntime:
             tuple[str, str, list[dict[str, Any]]]
         ] = deque()
         self.database_commit_condition = threading.Condition()
-        self.database_commit_accepting = True
+        self.database_commit_accepting = self.runtime_mode != "offline"
         self.database_commit_active_rounds = 0
         self.database_commit_high_water_rounds = 0
         self.database_commit_succeeded_rounds = 0
@@ -1321,24 +1359,49 @@ class ProviderRuntime:
             name="sick-database-commit",
             daemon=True,
         )
-        self.database_commit_thread.start()
-        for root in {profile.storage_root, *(camera.storage_root for camera in profile.enabled_cameras)}:
-            root.mkdir(parents=True, exist_ok=True)
-        self._recover_interrupted_flow_manifests()
-        try:
-            self.backend.start()
-        except Exception as error:
-            self.last_error = str(error)
-            self._log("error", "SICK GenTL initialization failed", error=str(error))
+        if self.runtime_mode != "offline":
+            self.database_commit_thread.start()
+        if self.runtime_mode != "offline":
+            for root in {
+                profile.storage_root,
+                *(camera.storage_root for camera in profile.enabled_cameras),
+            }:
+                root.mkdir(parents=True, exist_ok=True)
+            self._recover_interrupted_flow_manifests()
+        if self.runtime_mode != "offline":
+            try:
+                self.backend.start()
+            except Exception as error:
+                self.last_error = str(error)
+                self._log(
+                    "error",
+                    "capture backend initialization failed",
+                    runtimeMode=self.runtime_mode,
+                    error=str(error),
+                )
         if profile.auto_connect and not self.history_only and not self.last_error:
             self.connect_all()
-        if self.capture_mode == "continuous" and self.sessions:
+        if (
+            self.runtime_mode == "online"
+            and self.capture_mode == "continuous"
+            and self.sessions
+        ):
             self._ensure_acquisition_worker()
         # Full rendition audits can touch thousands of files across the camera
         # volumes.  Keep them off the constructor path so port 4317 becomes
         # available immediately; the discovery thread below owns both recent
         # and historical scheduling.
-        self.playback_discovery_thread.start()
+        if self.runtime_mode != "offline":
+            self.playback_discovery_thread.start()
+        else:
+            self.playback_history_status.update(
+                {
+                    "state": "disabled-offline-read-only",
+                    "policy": "read-only-on-demand",
+                    "discoveryComplete": True,
+                    "updatedAt": _utc_text(),
+                }
+            )
 
     def active_array_calibration(self) -> dict[str, Any]:
         """Resolve a gated candidate without requiring a capture restart."""
@@ -1406,6 +1469,7 @@ class ProviderRuntime:
             ]
             return {
                 "schema": "steel.sick-camera-connection.v1",
+                "runtimeMode": self.runtime_mode,
                 "historyOnly": self.history_only,
                 "inProgress": self.connection_in_progress,
                 "attemptCount": self.connection_attempt_count,
@@ -1445,7 +1509,7 @@ class ProviderRuntime:
         if self.history_only:
             return {
                 "code": 409,
-                "error": "history_only",
+                "error": "mode_offline",
                 "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
                 **self._connection_status_json(),
             }
@@ -1536,7 +1600,11 @@ class ProviderRuntime:
                         quality["updatedAt"] = failed_at
                 self.connection_in_progress = False
                 self.last_connection_completed_at = _utc_text()
-            if code != 0 and self.capture_mode == "continuous":
+            if (
+                code != 0
+                and self.runtime_mode == "online"
+                and self.capture_mode == "continuous"
+            ):
                 self._schedule_camera_reconnect(
                     [
                         camera.key
@@ -1563,7 +1631,11 @@ class ProviderRuntime:
     def _start_service_worker(self) -> None:
         try:
             result = self.connect_all()
-            if not self.history_only and self.sessions and self.capture_mode == "continuous":
+            if (
+                self.runtime_mode == "online"
+                and self.sessions
+                and self.capture_mode == "continuous"
+            ):
                 self._ensure_acquisition_worker()
             with self.service_transition_lock:
                 self.service_state = (
@@ -1585,6 +1657,15 @@ class ProviderRuntime:
             self._log("error", "SICK capture service start failed", error=str(error))
 
     def start_service(self) -> dict[str, Any]:
+        if self.runtime_mode == "offline":
+            return {
+                "code": 409,
+                "error": "mode_offline",
+                "serviceState": self.service_state,
+                **self._connection_status_json(),
+            }
+        if self.runtime_mode == "simulation":
+            return self._start_simulation_service()
         with self.service_transition_lock:
             if self.service_stop_thread is not None and self.service_stop_thread.is_alive():
                 return {
@@ -1627,6 +1708,15 @@ class ProviderRuntime:
         self._log("info", "SICK capture service stopped")
 
     def stop_service(self) -> dict[str, Any]:
+        if self.runtime_mode == "offline":
+            return {
+                "code": 409,
+                "error": "mode_offline",
+                "serviceState": self.service_state,
+                **self._connection_status_json(),
+            }
+        if self.runtime_mode == "simulation":
+            return self._stop_simulation_service()
         with self.service_transition_lock:
             self.history_only = True
             self.service_state = "stopping"
@@ -1647,6 +1737,494 @@ class ProviderRuntime:
                 "serviceState": self.service_state,
                 **self._connection_status_json(),
             }
+
+    def _wait_for_capture_quiescence(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        while time.monotonic() < deadline:
+            if (
+                not self._acquisition_running()
+                and self._persistence_is_quiescent()
+            ):
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _cancel_simulation_worker(
+        self,
+        coordinator: Any,
+        timeout_seconds: float,
+    ) -> bool:
+        """Invalidate one replay worker and wait without resetting its source."""
+
+        with self.state_lock:
+            self.acquisition_generation += 1
+            self.acquisition_stop.set()
+        coordinator.cancel_waiters()
+        acquisition_thread = self.acquisition_thread
+        if (
+            acquisition_thread is not None
+            and acquisition_thread.is_alive()
+            and acquisition_thread is not threading.current_thread()
+        ):
+            acquisition_thread.join(timeout=max(0.1, timeout_seconds))
+        return not bool(
+            acquisition_thread is not None and acquisition_thread.is_alive()
+        )
+
+    def _simulation_not_quiesced(
+        self,
+        coordinator: Any,
+        message: str,
+    ) -> dict[str, Any]:
+        self.last_error = message
+        self.service_state = "degraded"
+        return {
+            **coordinator.status(),
+            "code": 503,
+            "error": "simulation_not_quiesced",
+            "accepted": False,
+            "serviceState": self.service_state,
+            "quiesced": False,
+            "lastError": message,
+        }
+
+    def _persistence_is_quiescent(self) -> bool:
+        return bool(
+            self.storage_queue_pending_rounds == 0
+            and self.storage_queue_active_rounds == 0
+            and len(self.database_commit_queue) == 0
+            and self.database_commit_active_rounds == 0
+        )
+
+    def _wait_for_persistence_quiescence(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        while time.monotonic() < deadline:
+            if self._persistence_is_quiescent():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _simulation_open_source_session(self, batch: dict[str, Any]) -> None:
+        absolute_session = int(batch["absoluteSessionIndex"])
+        if self.simulation_active_absolute_session == absolute_session:
+            return
+        if self.simulation_active_absolute_session >= 0:
+            raise RuntimeError("simulation source session advanced without a boundary")
+        fallback_flow_no = time.time_ns()
+        source_session_id = str(batch.get("sessionId", ""))
+        source_coil_id = str(batch.get("coilId", ""))
+        coordinator = getattr(self.backend, "coordinator", None)
+        run_id = str(getattr(coordinator, "source_run_id", ""))
+        output_session_id = f"SIM-{run_id}-{absolute_session:06d}"
+        catalog = getattr(coordinator, "catalog", None)
+        source_dataset_id = str(getattr(catalog, "source_dataset_id", ""))
+        source_dataset_hash = str(getattr(catalog, "source_content_hash", ""))
+        source_session_hash = ""
+        session_index = int(batch.get("sessionIndex", -1) or -1)
+        catalog_sessions = tuple(getattr(catalog, "sessions", ()) or ())
+        if 0 <= session_index < len(catalog_sessions):
+            source_session_hash = str(
+                getattr(catalog_sessions[session_index], "source_content_hash", "")
+            )
+        business_material_id = (
+            f"SIM-{run_id[:12]}-{absolute_session:06d}"
+        )
+        production_payload = {
+            "schema": "steel.production-event.v1",
+            "cmd": "steelIn",
+            "value": 1,
+            "materialId": business_material_id,
+            "flowCode": source_coil_id,
+            "sessionId": output_session_id,
+            "source": "simulation-replay",
+            "mode": "simulation",
+            "controlMode": "simulation",
+            "triggerMode": "simulation",
+            "acquisitionMode": "simulation",
+            "captureMode": "continuous",
+            "storageRoot": str(self.profile.storage_root),
+            "saveEnabled": True,
+            "sourceMode": "simulation",
+            "sourceDatasetId": source_dataset_id,
+            "sourceDatasetContentHash": source_dataset_hash,
+            "sourceRunId": run_id,
+            "sourceSessionId": source_session_id,
+            "sourceContentHash": source_session_hash,
+            "sourceCoilId": source_coil_id,
+            "replayed": True,
+            "physicalCapture": False,
+            "synthetic": False,
+        }
+        result = self._post_service_json(
+            "/internal/v1/steel-in",
+            production_payload,
+        )
+        if int(result.get("code", 500)) != 0:
+            raise RuntimeError(
+                f"simulation output session could not be opened: {result}"
+            )
+        response_flow_no = result.get("flowNo")
+        capture_material_id = str(
+            response_flow_no
+            if response_flow_no not in (None, "")
+            else fallback_flow_no
+        )
+        response_session_id = str(result.get("sessionId") or output_session_id)
+        with self.state_lock:
+            provider_session_ready = bool(
+                self.steel_present
+                and self.active_session_id == response_session_id
+                and self.active_material_id
+            )
+        # The business service normally calls this provider back as part of the
+        # authoritative steel-in transaction.  Also support a separately wired
+        # provider (and lightweight test doubles) after the database accepted
+        # the event, without ever bypassing that database transaction.
+        if not provider_session_ready:
+            provider_result = self.steel_event(
+                {
+                    "cmd": "steelIn",
+                    "value": 1,
+                    "materialId": capture_material_id,
+                    "flowNo": int(capture_material_id),
+                    "flowCode": result.get("flowCode", source_coil_id),
+                    "sessionId": response_session_id,
+                    "captureMode": "continuous",
+                    "saveEnabled": True,
+                }
+            )
+            if int(provider_result.get("code", 500)) != 0:
+                raise RuntimeError(
+                    "simulation output provider session could not be opened: "
+                    f"{provider_result}"
+                )
+        with self.state_lock:
+            capture_material_id = self.active_material_id or capture_material_id
+        self.simulation_output_flows[absolute_session] = (
+            capture_material_id,
+            response_session_id,
+        )
+        self.simulation_active_absolute_session = absolute_session
+        self._log(
+            "info",
+            "simulation source session opened",
+            absoluteSessionIndex=absolute_session,
+            scheduledNs=int(batch.get("scheduledNs", 0) or 0),
+            cameraKeys=list(batch.get("cameraKeys", ())),
+            sourceSessionId=source_session_id,
+            sourceCoilId=source_coil_id,
+            sourceRunId=run_id,
+            outputMaterialId=capture_material_id,
+            outputSessionId=response_session_id,
+        )
+
+    def _simulation_close_source_session(self) -> None:
+        absolute_session = self.simulation_active_absolute_session
+        if absolute_session < 0:
+            return
+        material_id, session_id = self.simulation_output_flows[absolute_session]
+        if not self._wait_for_persistence_quiescence(
+            max(5.0, self.profile.timeout_ms / 1000.0 + 2.0)
+        ):
+            raise RuntimeError("simulation output frames did not flush before boundary")
+        result = self._post_service_json(
+            "/internal/v1/steel-out",
+            {
+                "schema": "steel.production-event.v1",
+                "cmd": "steelIn",
+                "value": 0,
+                "sessionId": session_id,
+                "source": "simulation-replay",
+                "mode": "simulation",
+                "controlMode": "simulation",
+                "triggerMode": "simulation",
+                "acquisitionMode": "simulation",
+                "captureMode": "continuous",
+                "storageRoot": str(self.profile.storage_root),
+                "sourceMode": "simulation",
+                "replayed": True,
+                "physicalCapture": False,
+                "synthetic": False,
+            },
+        )
+        if int(result.get("code", 500)) != 0:
+            raise RuntimeError(
+                f"simulation output session could not be closed: {result}"
+            )
+        with self.state_lock:
+            provider_session_closed = bool(
+                not self.steel_present or self.active_session_id != session_id
+            )
+        if not provider_session_closed:
+            provider_result = self.steel_event(
+                {
+                    "cmd": "steelIn",
+                    "value": 0,
+                    "materialId": material_id,
+                    "sessionId": session_id,
+                }
+            )
+            if int(provider_result.get("code", 500)) != 0:
+                raise RuntimeError(
+                    "simulation output provider session could not be closed: "
+                    f"{provider_result}"
+                )
+        if not self._wait_for_persistence_quiescence(
+            max(5.0, self.profile.timeout_ms / 1000.0 + 2.0)
+        ):
+            raise RuntimeError("simulation output session did not flush before boundary")
+        self.simulation_active_absolute_session = -1
+
+    def _start_simulation_service(self) -> dict[str, Any]:
+        try:
+            if not bool(getattr(self.backend, "started", False)):
+                self.backend.start()
+            if len(self.sessions) != self.profile.expected_cameras:
+                connection = self.connect_all()
+                if int(connection.get("code", 500)) != 0:
+                    return {
+                        **self.simulation_status(),
+                        "code": 503,
+                        "error": "simulation_channels_unavailable",
+                        "connection": connection,
+                    }
+            coordinator = getattr(self.backend, "coordinator", None)
+            if coordinator is None:
+                raise RuntimeError("simulation backend is not initialized")
+            if coordinator.state != "idle":
+                if not self._cancel_simulation_worker(
+                    coordinator,
+                    max(2.0, self.profile.timeout_ms / 1000.0 + 1.0),
+                ):
+                    return self._simulation_not_quiesced(
+                        coordinator,
+                        "simulation acquisition worker did not stop before service start",
+                    )
+                try:
+                    self._simulation_close_source_session()
+                except RuntimeError as error:
+                    return self._simulation_not_quiesced(
+                        coordinator, str(error)
+                    )
+                reset = coordinator.reset()
+                if int(reset.get("code", 500)) != 0:
+                    self.service_state = "degraded"
+                    return {
+                        **reset,
+                        "accepted": False,
+                        "serviceState": self.service_state,
+                        "quiesced": True,
+                    }
+                with self.storage_queue_lock:
+                    self.storage_queue_last_error = ""
+                self.database_commit_last_error = ""
+                self.last_error = ""
+            self.service_state = "idle"
+            return {
+                **coordinator.status(),
+                "code": 0,
+                "accepted": True,
+                "serviceState": self.service_state,
+                "quiesced": self._wait_for_capture_quiescence(2.0),
+            }
+        except (OSError, RuntimeError, ValueError) as error:
+            self.last_error = str(error)
+            self.service_state = "degraded"
+            return {
+                "code": 503,
+                "error": "simulation_source_unavailable",
+                "runtimeMode": self.runtime_mode,
+                "serviceState": self.service_state,
+                "state": "error",
+                "lastError": str(error),
+            }
+
+    def _stop_simulation_service(self) -> dict[str, Any]:
+        coordinator = getattr(self.backend, "coordinator", None)
+        if coordinator is None:
+            return self.simulation_status()
+        if coordinator.state == "running":
+            coordinator.pause()
+        if not self._cancel_simulation_worker(
+            coordinator,
+            max(2.0, self.profile.timeout_ms / 1000.0 + 1.0),
+        ):
+            return self._simulation_not_quiesced(
+                coordinator,
+                "simulation acquisition worker did not stop before service stop",
+            )
+        try:
+            self._simulation_close_source_session()
+        except RuntimeError as error:
+            return self._simulation_not_quiesced(coordinator, str(error))
+        quiesced = self._wait_for_capture_quiescence(
+            max(5.0, self.profile.timeout_ms / 1000.0 + 2.0)
+        )
+        self.service_state = "stopped" if quiesced else "degraded"
+        return {
+            **coordinator.status(),
+            "code": 0 if quiesced else 503,
+            **({"error": "simulation_not_quiesced"} if not quiesced else {}),
+            "accepted": quiesced,
+            "serviceState": self.service_state,
+            "quiesced": quiesced,
+        }
+
+    def simulation_status(self) -> dict[str, Any]:
+        if self.runtime_mode != "simulation":
+            return {
+                "code": 409,
+                "error": "mode_not_simulation",
+                "runtimeMode": self.runtime_mode,
+            }
+        status = getattr(self.backend, "status", None)
+        if not callable(status):
+            return {
+                "code": 503,
+                "error": "simulation_backend_unavailable",
+                "runtimeMode": self.runtime_mode,
+                "state": "error",
+                "channels": [],
+                "lastError": "capture backend does not expose simulation status",
+            }
+        return dict(status())
+
+    def simulation_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.runtime_mode != "simulation":
+            return self.simulation_status()
+        if "loop" in payload and not isinstance(payload["loop"], bool):
+            return {
+                "code": 400,
+                "error": "simulation loop must be a boolean",
+                "runtimeMode": self.runtime_mode,
+            }
+        try:
+            if not bool(getattr(self.backend, "started", False)):
+                self.backend.start()
+            coordinator = getattr(self.backend, "coordinator", None)
+            if coordinator is None:
+                raise RuntimeError("simulation backend is not initialized")
+            if len(self.sessions) != self.profile.expected_cameras:
+                connection = self.connect_all()
+                if int(connection.get("code", 500)) != 0:
+                    return {
+                        **self.simulation_status(),
+                        "code": 503,
+                        "error": "simulation_channels_unavailable",
+                        "connection": connection,
+                    }
+            if coordinator.state in {"idle", "completed"}:
+                if not self._cancel_simulation_worker(
+                    coordinator,
+                    max(2.0, self.profile.timeout_ms / 1000.0 + 1.0),
+                ):
+                    return self._simulation_not_quiesced(
+                        coordinator,
+                        "simulation acquisition worker did not stop before start",
+                    )
+                try:
+                    self._simulation_close_source_session()
+                except RuntimeError as error:
+                    return self._simulation_not_quiesced(coordinator, str(error))
+            result = coordinator.start(
+                speed=payload.get("speed"),
+                loop=payload.get("loop"),
+                session_gap_ms=payload.get("sessionGapMs"),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            self.last_error = str(error)
+            self.service_state = "degraded"
+            return {
+                "code": 400 if isinstance(error, ValueError) else 503,
+                "error": (
+                    "invalid_simulation_control"
+                    if isinstance(error, ValueError)
+                    else "simulation_source_unavailable"
+                ),
+                "runtimeMode": self.runtime_mode,
+                "state": "error",
+                "lastError": str(error),
+            }
+        if int(result.get("code", 500)) == 0:
+            self.simulation_active_absolute_session = -1
+            self.simulation_output_flows.clear()
+            self.service_state = "running"
+            # Formal replay is driven only by the simulation control endpoint.
+            # It must consume the shared coordinator regardless of the legacy
+            # physical-camera captureMode (on-demand/continuous/disabled).
+            self._ensure_acquisition_worker()
+        return result
+
+    def simulation_pause(self) -> dict[str, Any]:
+        if self.runtime_mode != "simulation":
+            return self.simulation_status()
+        coordinator = getattr(self.backend, "coordinator", None)
+        if coordinator is None:
+            return self.simulation_status()
+        result = coordinator.pause()
+        if int(result.get("code", 500)) == 0:
+            self.service_state = "paused"
+        return result
+
+    def simulation_resume(self) -> dict[str, Any]:
+        if self.runtime_mode != "simulation":
+            return self.simulation_status()
+        coordinator = getattr(self.backend, "coordinator", None)
+        if coordinator is None:
+            return self.simulation_status()
+        result = coordinator.resume()
+        if int(result.get("code", 500)) == 0:
+            self.service_state = "running"
+            self._ensure_acquisition_worker()
+        return result
+
+    def simulation_reset(self) -> dict[str, Any]:
+        if self.runtime_mode != "simulation":
+            return self.simulation_status()
+        coordinator = getattr(self.backend, "coordinator", None)
+        if coordinator is None:
+            return self.simulation_status()
+        if not self._cancel_simulation_worker(
+            coordinator,
+            max(2.0, self.profile.timeout_ms / 1000.0 + 1.0),
+        ):
+            return self._simulation_not_quiesced(
+                coordinator,
+                "simulation acquisition worker did not stop before reset",
+            )
+        try:
+            self._simulation_close_source_session()
+        except RuntimeError as error:
+            return self._simulation_not_quiesced(coordinator, str(error))
+        result = coordinator.reset()
+        if int(result.get("code", 500)) == 0:
+            with self.storage_queue_lock:
+                self.storage_queue_last_error = ""
+            self.database_commit_last_error = ""
+            self.last_error = ""
+            self.simulation_active_absolute_session = -1
+            self.simulation_output_flows.clear()
+            self.service_state = "idle"
+        else:
+            self.service_state = "degraded"
+        return result
+
+    def simulation_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        action = str(payload.get("action", "")).strip().lower()
+        if action == "start":
+            return self.simulation_start(payload)
+        if action == "pause":
+            return self.simulation_pause()
+        if action == "resume":
+            return self.simulation_resume()
+        if action == "reset":
+            return self.simulation_reset()
+        return {
+            "code": 400,
+            "error": "invalid_simulation_action",
+            "runtimeMode": self.runtime_mode,
+            "message": "action must be start, pause, resume, or reset",
+        }
 
     def disconnect(self, identity: str = "", *, force: bool = False) -> dict[str, Any]:
         if self.capture_lock.locked() and not force:
@@ -1717,7 +2295,8 @@ class ProviderRuntime:
         with self.database_commit_condition:
             self.database_commit_accepting = False
             self.database_commit_condition.notify_all()
-        self.database_commit_thread.join(timeout=60.0)
+        if self.database_commit_thread.is_alive():
+            self.database_commit_thread.join(timeout=60.0)
         with self.stream_lock:
             self.stream_subscriptions.clear()
             self.stream_started_at_by_camera.clear()
@@ -1760,6 +2339,20 @@ class ProviderRuntime:
         try:
             with urlrequest.urlopen(request, timeout=2.0) as response:
                 result = json.loads(response.read())
+        except urlerror.HTTPError as error:
+            try:
+                detail_body = error.read().decode("utf-8", errors="replace").strip()
+                detail_value = json.loads(detail_body) if detail_body else {}
+                detail = (
+                    detail_value.get("error")
+                    if isinstance(detail_value, dict)
+                    else detail_body
+                ) or detail_body or str(error)
+            except (OSError, ValueError):
+                detail = str(error)
+            raise RuntimeError(
+                f"inspection service callback failed: HTTP {error.code}: {detail}"
+            ) from error
         except (OSError, ValueError, urlerror.URLError) as error:
             raise RuntimeError(f"inspection service callback failed: {error}") from error
         if not isinstance(result, dict):
@@ -3521,6 +4114,8 @@ class ProviderRuntime:
         return True
 
     def _schedule_playback_warm(self, material_id: str) -> bool:
+        if getattr(self, "runtime_mode", "online") == "offline":
+            return False
         normalized = material_id.strip()
         with self.history_lock:
             view_priority = normalized in getattr(self, "playback_view_priority", ())
@@ -4234,6 +4829,7 @@ class ProviderRuntime:
             submitted_at = time.monotonic()
             committed: list[dict[str, Any]] = []
             committed_bytes = 0
+            persistence_errors: list[str] = []
             for future, camera, frame, source_row in futures:
                 try:
                     result = future.result()
@@ -4308,6 +4904,9 @@ class ProviderRuntime:
                         if stats is not None:
                             stats["successfulFrameCount"] += 1
                 except Exception as error:
+                    persistence_errors.append(
+                        f"{camera.key}: {type(error).__name__}: {error}"
+                    )
                     self._count_frames(failed=1)
                     self.last_error = str(error)
                     self._log(
@@ -4317,6 +4916,15 @@ class ProviderRuntime:
                         boundaryPhase=boundary_phase,
                         error=str(error),
                     )
+
+            if self.runtime_mode == "simulation" and persistence_errors:
+                # Replay is an exact, acknowledged event stream.  A failed
+                # artifact must fail the whole source event before the
+                # coordinator is allowed to advance to another event.
+                raise RuntimeError(
+                    "simulation persistence failed: "
+                    + "; ".join(persistence_errors)
+                )
 
             writes_completed_at = time.monotonic()
             finalize_wait_started = time.monotonic()
@@ -4550,7 +5158,7 @@ class ProviderRuntime:
                     boundaryPhase=boundary_phase,
                     error=str(error),
                 )
-            if not failed:
+            if not failed and self.runtime_mode != "simulation":
                 # A later durable round is the recovery proof for a transient
                 # writer failure. Keep lifetime counters, but do not leave the
                 # readiness gate permanently red after storage has recovered.
@@ -5418,11 +6026,22 @@ class ProviderRuntime:
         return reconnect
 
     def _camera_image_quality_json(self) -> dict[str, Any]:
+        physical_connections_visible = self.runtime_mode == "online"
         with self.state_lock:
             cameras = [
                 {
                     **dict(self.image_quality_states[camera.key]),
-                    "connected": camera.key in self.sessions,
+                    # `connected` is a legacy physical-camera signal.  Replay
+                    # channels are intentionally reported through the
+                    # simulation status contract instead of masquerading as
+                    # attached hardware.
+                    "connected": (
+                        physical_connections_visible and camera.key in self.sessions
+                    ),
+                    "replayChannelReady": (
+                        self.runtime_mode == "simulation"
+                        and camera.key in self.sessions
+                    ),
                     "automaticReconnect": dict(
                         self.image_quality_states[camera.key].get(
                             "automaticReconnect", {}
@@ -5561,6 +6180,10 @@ class ProviderRuntime:
 
     def _camera_row(self, camera: CameraProfile) -> dict[str, Any]:
         session = self.sessions.get(camera.key)
+        physical_connected = self.runtime_mode == "online" and session is not None
+        replay_channel_ready = (
+            self.runtime_mode == "simulation" and session is not None
+        )
         identity = getattr(session, "identity", {}) if session else {}
         with self.state_lock:
             stats_source = self.continuous_stats[camera.key]
@@ -5570,7 +6193,8 @@ class ProviderRuntime:
             }
             image_quality = {
                 **self.image_quality_states[camera.key],
-                "connected": camera.key in self.sessions,
+                "connected": physical_connected,
+                "replayChannelReady": replay_channel_ready,
                 "automaticReconnect": dict(
                     self.image_quality_states[camera.key].get(
                         "automaticReconnect", {}
@@ -5670,6 +6294,7 @@ class ProviderRuntime:
             else 0.0
         )
         return {
+            "runtimeMode": self.runtime_mode,
             "cameraIndex": camera.camera_index,
             "deviceId": camera.camera_index,
             "cameraId": camera.camera_id,
@@ -5680,8 +6305,20 @@ class ProviderRuntime:
             "model": identity.get("model", camera.model),
             "firmware": identity.get("firmware", ""),
             "role": camera.role,
-            "driverMode": "sick-gentl",
-            "driverId": "sick-gentl-harvesters",
+            "driverMode": (
+                "sick-gentl"
+                if self.runtime_mode == "online"
+                else "lg3d-replay"
+                if self.runtime_mode == "simulation"
+                else "offline-history"
+            ),
+            "driverId": (
+                "sick-gentl-harvesters"
+                if self.runtime_mode == "online"
+                else "lg3d-replay"
+                if self.runtime_mode == "simulation"
+                else "none"
+            ),
             "gentlBufferCount": (
                 int(getattr(session, "buffer_count", 0)) if session is not None else 0
             ),
@@ -5702,9 +6339,23 @@ class ProviderRuntime:
             "softwareTriggerCapable": bool(
                 trigger_status.get("softwareTriggerCapable", False)
             ),
-            "connected": session is not None,
-            "acquiring": bool(session is not None and getattr(session, "started", False)),
-            "acquisitionState": "acquiring" if continuous_running else "connected" if session else "offline",
+            "connected": physical_connected,
+            "acquiring": bool(
+                physical_connected and getattr(session, "started", False)
+            ),
+            "replayChannelReady": replay_channel_ready,
+            "simulationChannel": self.runtime_mode == "simulation",
+            "acquisitionState": (
+                "acquiring"
+                if physical_connected and continuous_running
+                else "connected"
+                if physical_connected
+                else "replay-running"
+                if replay_channel_ready and self._acquisition_running()
+                else "replay-ready"
+                if replay_channel_ready
+                else "offline"
+            ),
             "continuousAcquiring": continuous_running,
             "continuousFps": continuous_fps,
             "fps": continuous_fps,
@@ -5762,27 +6413,64 @@ class ProviderRuntime:
         }
 
     def cameras_json(self) -> dict[str, Any]:
+        physical_connected = (
+            len(self.sessions) if self.runtime_mode == "online" else 0
+        )
+        replay_channels = (
+            len(self.sessions) if self.runtime_mode == "simulation" else 0
+        )
+        driver_mode = (
+            "sick-gentl"
+            if self.runtime_mode == "online"
+            else "lg3d-replay"
+            if self.runtime_mode == "simulation"
+            else "offline-history"
+        )
+        driver_id = (
+            "sick-gentl-harvesters"
+            if self.runtime_mode == "online"
+            else "lg3d-replay"
+            if self.runtime_mode == "simulation"
+            else "none"
+        )
         return {
             "code": 0,
+            "runtimeMode": self.runtime_mode,
             "count": self.profile.expected_cameras,
-            "connectedCameras": len(self.sessions),
-            "driverMode": "sick-gentl",
-            "driverId": "sick-gentl-harvesters",
+            "connectedCameras": physical_connected,
+            "physicalCameraCount": physical_connected,
+            "simulationChannelCount": replay_channels,
+            "replayChannels": replay_channels,
+            "driverMode": driver_mode,
+            "driverId": driver_id,
             "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
         }
 
     def health_json(self) -> dict[str, Any]:
-        backend_ready = bool(getattr(self.backend, "started", False))
+        backend_ready = self.runtime_mode == "offline" or bool(
+            getattr(self.backend, "started", False)
+        )
         connected = len(self.sessions)
+        physical_connected = connected if self.runtime_mode == "online" else 0
+        replay_channels = connected if self.runtime_mode == "simulation" else 0
         image_quality = self._camera_image_quality_json()
         synchronization = self._synchronization_json()
         storage_queue = self._queue_json()
+        simulation_status = (
+            self.simulation_status() if self.runtime_mode == "simulation" else None
+        )
         readiness_reasons: list[str] = []
         if not backend_ready:
             readiness_reasons.append("capture-backend-unavailable")
-        if connected != self.profile.expected_cameras:
+        if (
+            self.runtime_mode != "offline"
+            and connected != self.profile.expected_cameras
+        ):
             readiness_reasons.append("camera-connection-count-mismatch")
-        if int(image_quality.get("activeAlarmCount", 0)) > 0:
+        if (
+            self.runtime_mode != "offline"
+            and int(image_quality.get("activeAlarmCount", 0)) > 0
+        ):
             readiness_reasons.append("camera-image-or-frame-alarm")
         # A globally aligned round is a metric-quality signal, but it is not a
         # capture-readiness prerequisite when the site deliberately routes
@@ -5792,7 +6480,7 @@ class ProviderRuntime:
         # Keep that condition visible in acquisitionSynchronization without
         # stopping the independent per-camera capture path.
         if (
-            not self.history_only
+            self.runtime_mode == "online"
             and self.capture_mode == "continuous"
             and not self.per_camera_flow_routing
             and synchronization.get("status") != "synchronized"
@@ -5802,12 +6490,52 @@ class ProviderRuntime:
             readiness_reasons.append("capture-storage-write-failed")
         if self.database_commit_last_error:
             readiness_reasons.append("capture-database-commit-pending")
+        if self.runtime_mode == "simulation" and (
+            not isinstance(simulation_status, dict)
+            or simulation_status.get("state") == "error"
+            or simulation_status.get("sourceAvailable") is False
+        ):
+            readiness_reasons.append("simulation-source-unavailable")
         provider_ready = not readiness_reasons
+        capture_ready = bool(
+            self.runtime_mode != "offline"
+            and backend_ready
+            and connected == self.profile.expected_cameras
+            and (
+                self.runtime_mode != "simulation"
+                or (
+                    isinstance(simulation_status, dict)
+                    and simulation_status.get("state") != "error"
+                    and simulation_status.get("sourceAvailable") is not False
+                )
+            )
+        )
+        driver_mode = (
+            "sick-gentl"
+            if self.runtime_mode == "online"
+            else "lg3d-replay"
+            if self.runtime_mode == "simulation"
+            else "offline-history"
+        )
+        driver_id = (
+            "sick-gentl-harvesters"
+            if self.runtime_mode == "online"
+            else "lg3d-replay"
+            if self.runtime_mode == "simulation"
+            else "none"
+        )
         with self.alignment_lock:
             alignment = dict(self.alignment_status)
             measurement = dict(self.measurement_status)
             defect_detection = dict(self.defect_detection_status)
         flow_analysis_queue = self._flow_analysis_queue_status()
+        quiesced = bool(
+            not self._acquisition_running()
+            and self.storage_queue_pending_rounds == 0
+            and self.storage_queue_active_rounds == 0
+            and len(self.database_commit_queue) == 0
+            and self.database_commit_active_rounds == 0
+        )
         return {
             "code": 0 if backend_ready else 49110,
             "service": "steel_sick_capture_sidecar",
@@ -5817,23 +6545,43 @@ class ProviderRuntime:
             # otherwise healthy external provider as malformed and falls back
             # to the legacy eight-camera defaults.
             "provider": "external-api",
+            "runtimeMode": self.runtime_mode,
             "historyOnly": self.history_only,
             "serviceState": self.service_state,
-            "connected": connected > 0,
-            "ip": self.profile.enabled_cameras[0].ip if self.profile.enabled_cameras else "",
+            "connected": physical_connected > 0,
+            "ip": (
+                self.profile.enabled_cameras[0].ip
+                if self.runtime_mode == "online" and self.profile.enabled_cameras
+                else ""
+            ),
             "ready": provider_ready,
             "providerReady": provider_ready,
+            "captureReady": capture_ready,
+            "quiesced": quiesced,
             "readinessReasons": readiness_reasons,
-            "sdkReady": backend_ready,
-            "sdkCode": 0 if backend_ready else 49110,
-            "driverMode": "sick-gentl",
-            "driverId": "sick-gentl-harvesters",
-            "driverName": "SICK GenTL Producer via Harvesters",
-            "ctiPath": str(self.profile.cti_path),
-            "ctiSha256": self.profile.cti_sha256,
+            "sdkRequired": self.runtime_mode == "online",
+            "sdkReady": backend_ready if self.runtime_mode == "online" else None,
+            "sdkCode": (
+                0 if backend_ready else 49110
+            ) if self.runtime_mode == "online" else None,
+            "driverMode": driver_mode,
+            "driverId": driver_id,
+            "driverName": (
+                "SICK GenTL Producer via Harvesters"
+                if self.runtime_mode == "online"
+                else "LG_3D deterministic replay"
+                if self.runtime_mode == "simulation"
+                else "Offline history reader"
+            ),
+            "ctiPath": str(self.profile.cti_path) if self.runtime_mode == "online" else None,
+            "ctiSha256": self.profile.cti_sha256 if self.runtime_mode == "online" else None,
             "storageRoot": str(self.profile.storage_root),
             "configRoot": str(self.profile.source_path.parent),
-            "cameraCount": connected,
+            "cameraCount": physical_connected,
+            "physicalCameraCount": physical_connected,
+            "physicalCamerasOnline": physical_connected,
+            "simulationChannelCount": replay_channels,
+            "replayChannels": replay_channels,
             "expectedCameras": self.profile.expected_cameras,
             "restartRequired": False,
             "recoveryRequired": bool(readiness_reasons) and backend_ready,
@@ -5848,8 +6596,20 @@ class ProviderRuntime:
             "framesCommitted": self.frames_committed,
             "framesFailed": self.frames_failed,
             "cameraConnection": self._connection_status_json(),
+            "simulation": (
+                simulation_status if self.runtime_mode == "simulation" else None
+            ),
             "databaseCommit": {
                 "schema": "steel.capture-database-commit.v1",
+                "required": self.runtime_mode != "offline",
+                "state": (
+                    "not-required"
+                    if self.runtime_mode == "offline"
+                    else "quiesced"
+                    if len(self.database_commit_queue) == 0
+                    and self.database_commit_active_rounds == 0
+                    else "busy"
+                ),
                 "capacityRounds": self.database_commit_capacity_rounds,
                 "maxBatchRounds": self.database_commit_max_batch_rounds,
                 "pendingRounds": len(self.database_commit_queue),
@@ -5875,15 +6635,27 @@ class ProviderRuntime:
             "lastError": self.last_error or None,
             "uptimeSeconds": round(time.time() - self.started_at, 3),
             "cameras": [self._camera_row(camera) for camera in self.profile.enabled_cameras],
-            "storageQueue": storage_queue,
+            "storageQueue": {
+                **storage_queue,
+                "required": self.runtime_mode != "offline",
+                "state": (
+                    "not-required"
+                    if self.runtime_mode == "offline"
+                    else "quiesced"
+                    if self.storage_queue_pending_rounds == 0
+                    and self.storage_queue_active_rounds == 0
+                    else "busy"
+                ),
+            },
         }
 
-    @staticmethod
-    def _path_capacity(root: Path) -> dict[str, Any]:
-        root.mkdir(parents=True, exist_ok=True)
+    def _path_capacity(self, root: Path) -> dict[str, Any]:
+        write_required = self.runtime_mode != "offline"
+        if write_required:
+            root.mkdir(parents=True, exist_ok=True)
         exists = root.is_dir()
         writable = False
-        if exists:
+        if exists and write_required:
             try:
                 with tempfile.NamedTemporaryFile(prefix=".steel-sick-write-probe-", dir=root, delete=True):
                     writable = True
@@ -5902,6 +6674,7 @@ class ProviderRuntime:
             capacity_available = False
         return {
             "root": str(root),
+            "writeRequired": write_required,
             "exists": exists,
             "writable": writable,
             "capacityAvailable": capacity_available,
@@ -6023,7 +6796,7 @@ class ProviderRuntime:
             {**self._path_capacity(camera.storage_root), "cameraKey": camera.key, "ip": camera.ip}
             for camera in self.profile.enabled_cameras
         ]
-        ok = (
+        ok = self.runtime_mode == "offline" or (
             root["exists"]
             and root["writable"]
             and root["capacityAvailable"]
@@ -6034,7 +6807,15 @@ class ProviderRuntime:
         )
         return {
             "code": 0 if ok else 49102,
-            "status": "up" if ok else "unavailable",
+            "status": (
+                "not-required"
+                if self.runtime_mode == "offline"
+                else "up"
+                if ok
+                else "unavailable"
+            ),
+            "runtimeMode": self.runtime_mode,
+            "writeRequired": self.runtime_mode != "offline",
             "root": str(self.profile.storage_root),
             "exists": root["exists"],
             "writable": root["writable"],
@@ -6174,6 +6955,12 @@ class ProviderRuntime:
         }
 
     def set_capture_mode(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.runtime_mode == "offline":
+            return {
+                "code": 409,
+                "error": "mode_offline",
+                "runtimeMode": self.runtime_mode,
+            }
         requested = str(payload.get("captureMode", payload.get("capture_mode", ""))).strip().lower()
         aliases = {
             "auto": "continuous",
@@ -6194,7 +6981,10 @@ class ProviderRuntime:
         with self.state_lock:
             changed = self.capture_mode != requested
             self.capture_mode = requested
-        if requested == "continuous":
+        if requested == "continuous" and (
+            self.runtime_mode == "online"
+            or self.simulation_status().get("state") == "running"
+        ):
             self._ensure_acquisition_worker()
         else:
             self._stop_acquisition_if_idle()
@@ -6212,6 +7002,12 @@ class ProviderRuntime:
         }
 
     def steel_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.runtime_mode == "offline":
+            return {
+                "code": 409,
+                "error": "mode_offline",
+                "runtimeMode": self.runtime_mode,
+            }
         command = str(payload.get("cmd", payload.get("command", ""))).strip()
         normalized = command.replace("_", "").lower()
         if not command:
@@ -6390,6 +7186,8 @@ class ProviderRuntime:
             self.acquisition_stop.clear()
             if self._acquisition_running():
                 return
+            self.acquisition_generation += 1
+            worker_generation = self.acquisition_generation
             # A camera's transport frame counter continues advancing while
             # acquisition is intentionally paused. Comparing the first frame
             # after resume with the old frame id would falsely report every
@@ -6401,6 +7199,7 @@ class ProviderRuntime:
             self.synchronization_warmup_remaining = self.synchronization_warmup_rounds
             thread = threading.Thread(
                 target=self._acquisition_loop,
+                args=(worker_generation,),
                 name="sick-live-acquisition",
                 daemon=True,
             )
@@ -6409,10 +7208,13 @@ class ProviderRuntime:
 
     def _stop_acquisition_if_idle(self) -> None:
         with self.state_lock:
-            continuous = self.capture_mode == "continuous"
+            automatic_capture = (
+                self.capture_mode == "continuous"
+                or self.runtime_mode == "simulation"
+            )
         with self.stream_lock:
             streaming = bool(self.stream_subscriptions)
-        if not continuous and not streaming:
+        if not automatic_capture and not streaming:
             self.acquisition_stop.set()
 
     @staticmethod
@@ -6919,6 +7721,23 @@ class ProviderRuntime:
             }
 
     def start_stream(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.runtime_mode == "offline":
+            return {
+                "code": 409,
+                "error": "mode_offline",
+                "runtimeMode": self.runtime_mode,
+                "running": False,
+            }
+        if (
+            self.runtime_mode == "simulation"
+            and self.simulation_status().get("state") != "running"
+        ):
+            return {
+                "code": 409,
+                "error": "simulation_not_running",
+                "runtimeMode": self.runtime_mode,
+                "running": False,
+            }
         identity = str(payload.get("ip", payload.get("cameraId", ""))).strip()
         camera = self.camera_for_identity(identity)
         if camera is None:
@@ -7130,24 +7949,31 @@ class ProviderRuntime:
                     NO_STEEL_FRAME_DISCARDED,
                 }:
                     self.continuous_discarded_frame_count += 1
-            # The reference signal supplies the global flow context. With
-            # per-camera routing the quality state machine additionally gates
-            # each view on its own materialSignal, because the six cameras do
-            # not observe the head/tail in the same acquisition round.
-            boundary_rows = self._steel_detection_rows(results)
-            signal_cameras = sum(bool(row.get("steelSignal")) for row in boundary_rows)
-            required = (
-                min(self.steel_min_cameras, len(boundary_rows))
-                if boundary_rows
-                else 1
-            )
-            reconnect_camera_keys = self._record_image_quality_round_locked(
-                results,
-                steel_context=bool(
-                    persist_frame
-                    or (boundary_rows and signal_cameras >= required)
-                ),
-            )
+            if self.runtime_mode != "simulation":
+                # The reference signal supplies the global flow context. With
+                # per-camera routing the quality state machine additionally
+                # gates each view on its own materialSignal, because the six
+                # cameras do not observe the head/tail in the same acquisition
+                # round. Replay batches intentionally contain only cameras
+                # whose source timestamp is due; treating absent channels as
+                # failed physical cameras would quarantine valid replay tracks
+                # and destroy the global timestamp ordering.
+                boundary_rows = self._steel_detection_rows(results)
+                signal_cameras = sum(
+                    bool(row.get("steelSignal")) for row in boundary_rows
+                )
+                required = (
+                    min(self.steel_min_cameras, len(boundary_rows))
+                    if boundary_rows
+                    else 1
+                )
+                reconnect_camera_keys = self._record_image_quality_round_locked(
+                    results,
+                    steel_context=bool(
+                        persist_frame
+                        or (boundary_rows and signal_cameras >= required)
+                    ),
+                )
         if reconnect_camera_keys:
             self._schedule_camera_reconnect(reconnect_camera_keys)
 
@@ -7338,7 +8164,9 @@ class ProviderRuntime:
             "lastRound": last,
         }
 
-    def _acquisition_loop(self) -> None:
+    def _acquisition_loop(self, worker_generation: int | None = None) -> None:
+        if worker_generation is None:
+            worker_generation = self.acquisition_generation
         self.capture_lock.acquire()
         self._log("info", "SICK shared continuous acquisition started")
         pre_entry_cache: deque[list[dict[str, Any]]] = deque(
@@ -7353,20 +8181,27 @@ class ProviderRuntime:
             maxlen=self.black_frame_cache_rounds
         )
         try:
-            while not self.acquisition_stop.is_set():
+            while (
+                not self.acquisition_stop.is_set()
+                and worker_generation == self.acquisition_generation
+            ):
                 with self.state_lock:
                     continuous = self.capture_mode == "continuous"
-                    persist_frame = continuous and self.steel_present and self.save_enabled
+                    replay_capture = self.runtime_mode == "simulation"
+                    automatic_capture = continuous or replay_capture
+                    persist_frame = (
+                        automatic_capture and self.steel_present and self.save_enabled
+                    )
                     material_id = self.active_material_id
                     session_id = self.active_session_id
                     save_generation = self.save_generation if persist_frame else None
                 with self.stream_lock:
                     stream_keys = set(self.stream_subscriptions)
-                if not continuous and not stream_keys:
+                if not automatic_capture and not stream_keys:
                     break
                 selected = (
                     list(self.profile.enabled_cameras)
-                    if continuous
+                    if automatic_capture
                     else [
                         camera
                         for camera in self.profile.enabled_cameras
@@ -7377,6 +8212,53 @@ class ProviderRuntime:
                 if not selected:
                     self.acquisition_stop.wait(0.25)
                     continue
+                if self.runtime_mode == "simulation":
+                    coordinator = getattr(self.backend, "coordinator", None)
+                    if coordinator is None:
+                        self.last_error = "simulation backend is not initialized"
+                        break
+                    try:
+                        simulation_batch = coordinator.next_event_batch(
+                            [camera.key for camera in selected],
+                            self.profile.timeout_ms,
+                        )
+                    except ReplayCompleted:
+                        break
+                    except TimeoutError:
+                        continue
+                    except Exception as error:
+                        coordinator.fail(error)
+                        self.last_error = str(error)
+                        break
+                    if simulation_batch.get("kind") == "session-boundary":
+                        try:
+                            self._simulation_close_source_session()
+                        except Exception as error:
+                            coordinator.fail(error)
+                            self.last_error = str(error)
+                            break
+                        continue
+                    try:
+                        self._simulation_open_source_session(simulation_batch)
+                    except Exception as error:
+                        coordinator.fail(error)
+                        self.last_error = str(error)
+                        break
+                    due_camera_keys = set(simulation_batch["cameraKeys"])
+                    selected = [
+                        camera for camera in selected if camera.key in due_camera_keys
+                    ]
+                    with self.state_lock:
+                        persist_frame = (
+                            automatic_capture
+                            and self.steel_present
+                            and self.save_enabled
+                        )
+                        material_id = self.active_material_id
+                        session_id = self.active_session_id
+                        save_generation = (
+                            self.save_generation if persist_frame else None
+                        )
                 with self.state_lock:
                     self.continuous_round += 1
                     round_index = self.continuous_round
@@ -7387,15 +8269,17 @@ class ProviderRuntime:
                     "sessionId": session_id,
                     "timeoutMs": self.profile.timeout_ms,
                     "retries": (
-                        self.startup_capture_retries
+                        0
+                        if self.runtime_mode == "simulation"
+                        else self.startup_capture_retries
                         if round_index <= self.synchronization_warmup_rounds
                         else 0
                     ),
                     "discardBlackFrames": True,
                     "blackFrameThreshold": self.profile.black_frame_threshold,
                     "_persistFrame": persist_frame,
-                    "_retainRawFrame": continuous,
-                    "_deferPersistence": continuous and persist_frame,
+                    "_retainRawFrame": automatic_capture,
+                    "_deferPersistence": automatic_capture and persist_frame,
                 }
                 results = self._run_capture_round(
                     selected,
@@ -7403,8 +8287,76 @@ class ProviderRuntime:
                     round_index,
                     save_generation,
                 )
-                if continuous:
+                if worker_generation != self.acquisition_generation:
+                    self._log(
+                        "info",
+                        "stale acquisition generation discarded",
+                        workerGeneration=worker_generation,
+                        activeGeneration=self.acquisition_generation,
+                        frameCount=sum(
+                            bool(row.get("frameReceived")) for row in results
+                        ),
+                    )
+                    break
+                if self.runtime_mode == "simulation" and self.simulation_status().get(
+                    "state"
+                ) in {"completed", "error"}:
+                    break
+                if automatic_capture:
                     self._record_continuous_round(results, persist_frame)
+                    if self.runtime_mode == "simulation":
+                        if persist_frame:
+                            with self.storage_queue_lock:
+                                failed_rounds_before = self.storage_queue_failed_rounds
+                            try:
+                                accepted = self._enqueue_storage_round(
+                                    results,
+                                    material_id=material_id,
+                                    session_id=session_id,
+                                    boundary_phase="simulation-source-event",
+                                    require_steel_signal=False,
+                                    save_generation=save_generation,
+                                )
+                                if not accepted:
+                                    raise RuntimeError(
+                                        "simulation source event was not admitted to storage"
+                                    )
+                                if not self._wait_for_persistence_quiescence(
+                                    max(
+                                        5.0,
+                                        self.profile.timeout_ms / 1000.0 + 2.0,
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "simulation source event did not become durable before timeout"
+                                    )
+                                with self.storage_queue_lock:
+                                    storage_failed = (
+                                        self.storage_queue_failed_rounds
+                                        > failed_rounds_before
+                                    )
+                                    storage_error = self.storage_queue_last_error
+                                if storage_failed or storage_error:
+                                    raise RuntimeError(
+                                        "simulation source event persistence failed: "
+                                        + (storage_error or "storage writer failure")
+                                    )
+                                if self.database_commit_last_error:
+                                    raise RuntimeError(
+                                        "simulation source event database commit failed: "
+                                        + self.database_commit_last_error
+                                    )
+                            except Exception as error:
+                                coordinator = getattr(self.backend, "coordinator", None)
+                                if coordinator is not None:
+                                    coordinator.fail(error)
+                                self.last_error = str(error)
+                                break
+                        if results and all(
+                            not row.get("frameReceived") for row in results
+                        ):
+                            self.acquisition_stop.wait(0.01)
+                        continue
                     self._record_synchronization_round(results)
                     if self.per_camera_flow_routing:
                         # The reference camera owns only the global flow
@@ -7879,6 +8831,58 @@ class ProviderRuntime:
                 )
                 self._count_frames(committed=1)
                 return row
+            except ReplayCompleted:
+                return {
+                    "code": 0,
+                    "errorName": "SIMULATION_CHANNEL_COMPLETED",
+                    "operatorHint": "the replay channel has no remaining source frames",
+                    "cameraId": camera.camera_id,
+                    "cameraKey": camera.key,
+                    "ip": camera.ip,
+                    "sn": camera.serial_number,
+                    "round": round_index,
+                    "parallelIndex": parallel_index,
+                    "captureAttempts": capture_attempt,
+                    "completeFrame": False,
+                    "depthExists": False,
+                    "intensityExists": False,
+                    "metadataExists": False,
+                    "frameReceived": False,
+                    "discarded": True,
+                    "discardReason": "simulation-channel-completed",
+                    "runtimeMode": self.runtime_mode,
+                    "workerStartedNs": started_ns,
+                    "workerCompletedNs": time.time_ns(),
+                }
+            except TimeoutError as error:
+                if self.runtime_mode == "simulation" and self.simulation_status().get(
+                    "state"
+                ) in {"idle", "paused"}:
+                    return {
+                        "code": 0,
+                        "errorName": "SIMULATION_NOT_ADVANCING",
+                        "operatorHint": str(error),
+                        "cameraId": camera.camera_id,
+                        "cameraKey": camera.key,
+                        "ip": camera.ip,
+                        "sn": camera.serial_number,
+                        "round": round_index,
+                        "parallelIndex": parallel_index,
+                        "captureAttempts": capture_attempt,
+                        "completeFrame": False,
+                        "depthExists": False,
+                        "intensityExists": False,
+                        "metadataExists": False,
+                        "frameReceived": False,
+                        "discarded": True,
+                        "discardReason": "simulation-not-advancing",
+                        "runtimeMode": self.runtime_mode,
+                        "workerStartedNs": started_ns,
+                        "workerCompletedNs": time.time_ns(),
+                    }
+                last_error = error
+                if capture_attempt <= retries:
+                    continue
             except FileExistsError as error:
                 last_error = error
                 break
@@ -7951,7 +8955,20 @@ class ProviderRuntime:
 
     def continuous_capture(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if self.history_only:
-            return 409, {"code": 409, "error": "history_only"}
+            return 409, {
+                "code": 409,
+                "error": "mode_offline",
+                "runtimeMode": self.runtime_mode,
+            }
+        if self.runtime_mode == "simulation":
+            simulation = self.simulation_status()
+            if simulation.get("state") != "running":
+                return 409, {
+                    "code": 409,
+                    "error": "simulation_not_running",
+                    "runtimeMode": self.runtime_mode,
+                    "simulation": simulation,
+                }
         if not self.capture_lock.acquire(blocking=False):
             return 409, {"code": 409, "error": "capture_already_running"}
         try:
@@ -8124,10 +9141,24 @@ class ProviderRuntime:
         return status, summary
 
     def profile_status(self) -> dict[str, Any]:
+        driver_mode = (
+            "sick-gentl"
+            if self.runtime_mode == "online"
+            else "lg3d-replay"
+            if self.runtime_mode == "simulation"
+            else "offline-history"
+        )
         return {
             "code": 0,
-            "driverMode": "sick-gentl",
-            "driverId": "sick-gentl-harvesters",
+            "runtimeMode": self.runtime_mode,
+            "driverMode": driver_mode,
+            "driverId": (
+                "sick-gentl-harvesters"
+                if self.runtime_mode == "online"
+                else "lg3d-replay"
+                if self.runtime_mode == "simulation"
+                else "none"
+            ),
             "activeProfile": self.profile.name,
             "profilePath": str(self.profile.source_path),
             "profiles": [self.profile.name],
@@ -8945,6 +9976,46 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return payload
 
+    def _mode_write_guard(self, path: str) -> dict[str, Any] | None:
+        """Fail closed for sidecar write APIs outside the active mode contract.
+
+        Runtime-internal calls (for example replay session boundaries invoking
+        ``steel_event``) do not pass through HTTP and remain available.  This
+        guard prevents a client connected directly to the Python sidecar from
+        bypassing the service proxy's acquisition-mode policy.
+        """
+
+        if self.runtime.runtime_mode == "offline":
+            return {
+                "code": 409,
+                "error": "mode_offline",
+                "runtimeMode": "offline",
+                "operation": path,
+            }
+        if self.runtime.runtime_mode != "simulation":
+            return None
+        allowed = {
+            "/api/service/start",
+            "/api/service/stop",
+            "/api/capture/simulation/control",
+            "/api/simulation/start",
+            "/api/simulation/pause",
+            "/api/simulation/resume",
+            "/api/simulation/reset",
+            "/api/capture/simulation/start",
+            "/api/capture/simulation/pause",
+            "/api/capture/simulation/resume",
+            "/api/capture/simulation/reset",
+        }
+        if path in allowed:
+            return None
+        return {
+            "code": 409,
+            "error": "mode_simulation_physical_operation_forbidden",
+            "runtimeMode": "simulation",
+            "operation": path,
+        }
+
     def _send_image_access_headers(self) -> None:
         # These headers apply only to read-only binary image responses.  They
         # let the Tauri/WebView UI render loopback previews without Chromium
@@ -9005,6 +10076,13 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(split.query)
         if path in {"/health", "/api/capture/health"}:
             self._send_json(200, self.runtime.health_json())
+        elif path in {
+            "/api/capture/simulation/status",
+            "/api/simulation/status",
+        }:
+            payload = self.runtime.simulation_status()
+            status = int(payload.get("code", 500))
+            self._send_json(200 if status == 0 else status, payload)
         elif path == "/api/storage/status":
             payload = self.runtime.storage_json()
             self._send_json(200 if payload["code"] == 0 else 503, payload)
@@ -9144,12 +10222,34 @@ class SickCaptureRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        mode_error = self._mode_write_guard(path)
+        if mode_error is not None:
+            self._send_json(409, mode_error)
+            return
         try:
             payload = self._payload()
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             self._send_json(400, {"code": 400, "error": str(error)})
             return
-        if path in {"/api/cameras/connect-all", "/api/camera/connect-all"}:
+        if path == "/api/capture/simulation/control":
+            result = self.runtime.simulation_control(payload)
+            status = int(result.get("code", 500))
+            self._send_json(200 if status == 0 else status, result)
+        elif path in {
+            "/api/simulation/start",
+            "/api/simulation/pause",
+            "/api/simulation/resume",
+            "/api/simulation/reset",
+            "/api/capture/simulation/start",
+            "/api/capture/simulation/pause",
+            "/api/capture/simulation/resume",
+            "/api/capture/simulation/reset",
+        }:
+            action = path.rsplit("/", 1)[-1]
+            result = self.runtime.simulation_control({**payload, "action": action})
+            status = int(result.get("code", 500))
+            self._send_json(200 if status == 0 else status, result)
+        elif path in {"/api/cameras/connect-all", "/api/camera/connect-all"}:
             result = self.runtime.connect_all(payload)
             status = (
                 200
@@ -9262,6 +10362,12 @@ def serve(
     port: int = 4317,
     *,
     history_only: bool = False,
+    runtime_profile: Path | str | None = None,
+    runtime_mode: str | None = None,
+    simulation_source: Path | str | None = None,
+    simulation_speed: float | None = None,
+    simulation_loop: bool | None = None,
+    simulation_session_gap_ms: int | None = None,
 ) -> None:
     if host.lower() != "localhost":
         try:
@@ -9270,10 +10376,94 @@ def serve(
             raise ValueError("SICK sidecar host must be a loopback address") from error
         if not address.is_loopback:
             raise ValueError("SICK sidecar host must be a loopback address")
-    profile = load_profile(profile_path)
-    if history_only:
+    runtime_payload: dict[str, Any] = {}
+    runtime_profile_path: Path | None = None
+    if runtime_profile is not None:
+        runtime_profile_path = Path(runtime_profile).resolve(strict=True)
+        loaded_runtime = json.loads(
+            runtime_profile_path.read_text(encoding="utf-8-sig")
+        )
+        if not isinstance(loaded_runtime, dict):
+            raise ValueError("runtime profile must be a JSON object")
+        runtime_payload = loaded_runtime
+    configured_mode = (
+        runtime_mode
+        if runtime_mode is not None
+        else "offline"
+        if history_only
+        else str(runtime_payload.get("acquisitionMode", ""))
+    )
+    mode = normalize_runtime_mode(configured_mode, history_only=history_only)
+    supervisor_mode_value = os.environ.get("STEEL_ACQUISITION_MODE")
+    if supervisor_mode_value is not None:
+        supervisor_mode = supervisor_mode_value.strip().lower()
+        if supervisor_mode not in {"online", "offline", "simulation"}:
+            raise ValueError(
+                "STEEL_ACQUISITION_MODE must be online, offline, or simulation"
+            )
+        if supervisor_mode != mode:
+            raise ValueError(
+                "capture acquisition mode split-brain: "
+                f"STEEL_ACQUISITION_MODE={supervisor_mode!r} "
+                f"does not match resolved profile mode={mode!r}"
+            )
+    simulation_payload = runtime_payload.get("simulation", {})
+    if not isinstance(simulation_payload, dict):
+        raise ValueError("runtime profile simulation must be an object")
+    configured_source = simulation_payload.get("sourceRoot")
+    if simulation_source is None and configured_source is not None and str(
+        configured_source
+    ).strip():
+        configured_path = Path(os.path.expandvars(str(configured_source)))
+        simulation_source = (
+            configured_path
+            if configured_path.is_absolute() or runtime_profile_path is None
+            else (runtime_profile_path.parent / configured_path).resolve()
+        )
+    speed = float(
+        simulation_speed
+        if simulation_speed is not None
+        else simulation_payload.get("speed", 1.0)
+    )
+    configured_loop = (
+        simulation_loop
+        if simulation_loop is not None
+        else simulation_payload.get("loop", False)
+    )
+    if not isinstance(configured_loop, bool):
+        raise ValueError("runtime profile simulation.loop must be a boolean")
+    loop = configured_loop
+    configured_gap = simulation_payload.get(
+        "interSessionGapMs",
+        simulation_payload.get(
+            "gapMs",
+            simulation_payload.get("sessionGapMs", 1_500),
+        ),
+    )
+    session_gap_ms = int(
+        simulation_session_gap_ms
+        if simulation_session_gap_ms is not None
+        else configured_gap
+    )
+    profile = load_profile(
+        profile_path,
+        strict_hardware=mode == "online",
+        verify_cti=mode == "online",
+    )
+    if mode == "simulation" and profile.expected_cameras != 6:
+        raise ValueError(
+            "formal simulation mode requires exactly six configured replay channels"
+        )
+    if mode == "offline":
         profile = replace(profile, auto_connect=False)
-    runtime = ProviderRuntime(profile, history_only=history_only)
+    runtime = ProviderRuntime(
+        profile,
+        runtime_mode=mode,
+        simulation_source=simulation_source,
+        simulation_speed=speed,
+        simulation_loop=loop,
+        simulation_session_gap_ms=session_gap_ms,
+    )
     server = SickCaptureHTTPServer((host, port), runtime)
     print(
         json.dumps(
@@ -9282,7 +10472,12 @@ def serve(
                 "origin": f"http://{host}:{port}",
                 "profile": str(profile.source_path),
                 "expectedCameras": profile.expected_cameras,
-                "historyOnly": history_only,
+                "runtimeMode": mode,
+                "historyOnly": mode == "offline",
+                "runtimeProfile": str(runtime_profile_path) if runtime_profile_path else None,
+                "simulationSource": (
+                    str(simulation_source) if mode == "simulation" else None
+                ),
             },
             ensure_ascii=False,
         ),

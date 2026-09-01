@@ -2,6 +2,7 @@
   "schema": "steel.runtime-profile.v1",
   "id": "bkv-online-6",
   "displayName": "BKV 六相机在线转换",
+  "acquisitionMode": "offline",
   "provider": "bkv",
   "dataSource": "bkv-online-mysql",
   "cameraConnection": "none",

@@ -71,6 +71,8 @@ pub(crate) struct BackgroundMonitorService {
     pub startup_mode: String,
     pub auto_restart: bool,
     pub managed: bool,
+    pub enabled_for_mode: bool,
+    pub acquisition_mode: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -472,6 +474,11 @@ fn service_snapshot(value: &Value) -> Option<BackgroundMonitorService> {
             .get("managed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        enabled_for_mode: value
+            .get("enabledForMode")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        acquisition_mode: value_text(value, "acquisitionMode", "online", 32),
     })
 }
 
@@ -780,6 +787,8 @@ fn supervisor_service_snapshot(value: SupervisorServiceSnapshot) -> BackgroundMo
         startup_mode: value.startup_mode,
         auto_restart: value.auto_restart,
         managed: value.managed,
+        enabled_for_mode: value.enabled_for_mode,
+        acquisition_mode: value.acquisition_mode,
     }
 }
 
@@ -1544,6 +1553,8 @@ mod tests {
                     startup_mode: "normal".to_string(),
                     auto_restart: true,
                     managed: true,
+                    enabled_for_mode: true,
+                    acquisition_mode: "online".to_string(),
                 }],
                 lifecycle_logs: Vec::new(),
                 registry: json!({"schema":"steel.service-registry.v1"}),

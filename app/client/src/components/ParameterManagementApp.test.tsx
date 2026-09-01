@@ -149,6 +149,13 @@ const adminRecordPage = {
       plateNo: '202606131900',
       status: 'detecting',
       defectCount: 12,
+      sourceMode: 'simulation',
+      sourceDatasetId: 'usb-dataset-1',
+      sourceRunId: 'run-1',
+      sourceSessionId: 'source-session-1',
+      sourceContentHash: 'abc123',
+      replayed: true,
+      productionEligible: false,
       plate: {
         plateNo: '202606131900',
         widthMm: 3500,
@@ -621,6 +628,50 @@ const adminRuntimeProfile = {
   restartRequired: false,
 };
 
+const adminDirectRuntimeProfile = {
+  ...adminRuntimeProfile,
+  activeProfile: {
+    ...adminRuntimeProfile.activeProfile,
+    profileId: 'sick-array-6',
+    displayName: 'SICK 六相机 GenTL 实时检测',
+    acquisitionMode: 'online' as const,
+    provider: 'external-api',
+    dataSource: 'online-production',
+    cameraConnection: 'headless-cpp',
+    cameras: adminRuntimeProfile.activeProfile.cameras.map((camera) => ({
+      ...camera,
+      role: `sick-${camera.sourceCameraId}`,
+    })),
+    capabilities: {
+      directCamera: true,
+      captureManagement: true,
+      reconstruction: true,
+      offlineReplay: true,
+    },
+  },
+  savedProfile: {
+    ...adminRuntimeProfile.savedProfile,
+    id: 'sick-array-6',
+    displayName: 'SICK 六相机 GenTL 实时检测',
+    acquisitionMode: 'online' as const,
+    provider: 'external-api',
+    dataSource: 'online-production',
+    cameraConnection: 'headless-cpp',
+    captureProfile: 'capture.json',
+    cameras: adminRuntimeProfile.savedProfile.cameras.map((camera) => ({
+      ...camera,
+      role: `sick-${camera.sourceCameraId}`,
+      sourceDirectory: '',
+    })),
+    capabilities: {
+      directCamera: true,
+      captureManagement: true,
+      reconstruction: true,
+      offlineReplay: true,
+    },
+  },
+};
+
 const adminBkvImportStatus = {
   schema: 'steel.bkv-import-service.v1',
   ready: true,
@@ -656,6 +707,9 @@ describe('ParameterManagementApp', () => {
   let saveRoleFailureResponse: { status: number; payload: Record<string, unknown> } | null = null;
   let sessionPermissionsOverride: string[] | null = null;
   let runtimeProfileValidationFailure = false;
+  let runtimeProfileResponse: typeof adminRuntimeProfile | typeof adminDirectRuntimeProfile = adminRuntimeProfile;
+  let supervisorAcquisitionMode: 'online' | 'offline' | 'simulation' = 'online';
+  let runtimeProfileSaveRequiresRecovery = false;
   let failBkvImportStatus = false;
   let managementOnly = false;
 
@@ -675,6 +729,9 @@ describe('ParameterManagementApp', () => {
     saveRoleFailureResponse = null;
     sessionPermissionsOverride = null;
     runtimeProfileValidationFailure = false;
+    runtimeProfileResponse = adminRuntimeProfile;
+    supervisorAcquisitionMode = 'online';
+    runtimeProfileSaveRequiresRecovery = false;
     failBkvImportStatus = false;
     managementOnly = false;
     setAdminOverviewSiteMode('bkv');
@@ -958,6 +1015,9 @@ describe('ParameterManagementApp', () => {
         };
       }
       if (url.includes('/api/admin/runtime-profile') && init?.method === 'POST') {
+        const candidate = JSON.parse(String(init.body)).profile as { acquisitionMode?: 'online' | 'offline' | 'simulation' };
+        const targetAcquisitionMode = candidate.acquisitionMode ?? 'online';
+        supervisorAcquisitionMode = targetAcquisitionMode;
         return {
           ok: true,
           json: async () => ({
@@ -966,11 +1026,20 @@ describe('ParameterManagementApp', () => {
             activeConfigHash: 'active-hash',
             savedConfigHash: 'saved-hash',
             restartRequired: true,
+            modeTransitionAccepted: true,
+            modeTransitionCommitted: false,
+            modeTransitionState: runtimeProfileSaveRequiresRecovery
+              ? 'publish-pending-recovery'
+              : 'ready',
+            recoveryRequired: runtimeProfileSaveRequiresRecovery,
+            transitionId: 'mode-test-001',
+            releaseAfterMillis: Date.now(),
+            targetAcquisitionMode,
           }),
         };
       }
       if (url.includes('/api/admin/runtime-profile')) {
-        return { ok: true, json: async () => adminRuntimeProfile };
+        return { ok: true, json: async () => runtimeProfileResponse };
       }
       if (url.includes('/api/admin/bkv-import/jobs/retry')) {
         return {
@@ -1210,6 +1279,36 @@ describe('ParameterManagementApp', () => {
           json: async () => ({
             service: { name: 'steel-inspection-service' },
             capture: { mode: 'single-camera' },
+          }),
+        };
+      }
+      if (url === 'http://127.0.0.1:4899/api/status') {
+        const captureEnabled = supervisorAcquisitionMode !== 'offline';
+        const triggerEnabled = supervisorAcquisitionMode === 'online';
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            services: [
+              { id: 'inspection', name: 'inspection', required: true, ok: true, enabledForMode: true, acquisitionMode: supervisorAcquisitionMode },
+              { id: 'capture', name: 'capture', required: captureEnabled, ok: true, enabledForMode: captureEnabled, acquisitionMode: supervisorAcquisitionMode },
+              { id: 'image-worker', name: 'image-worker', required: captureEnabled, ok: true, enabledForMode: captureEnabled, acquisitionMode: supervisorAcquisitionMode },
+              { id: 'defect-worker', name: 'defect-worker', required: captureEnabled, ok: true, enabledForMode: captureEnabled, acquisitionMode: supervisorAcquisitionMode },
+              { id: 'trigger', name: 'trigger', required: triggerEnabled, ok: true, enabledForMode: triggerEnabled, acquisitionMode: supervisorAcquisitionMode },
+            ],
+          }),
+        };
+      }
+      if (url.startsWith('http://127.0.0.1:4899/api/services/')) {
+        const parts = new URL(url).pathname.split('/');
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            serviceId: parts[3],
+            action: parts[4],
+            message: `${parts[3]} ${parts[4]}`,
           }),
         };
       }
@@ -1823,6 +1922,7 @@ describe('ParameterManagementApp', () => {
     fireEvent.click(screen.getByRole('button', { name: '数据' }));
     expect(screen.getByText('202606131900')).toBeInTheDocument();
     expect(screen.getByText('Q355B')).toBeInTheDocument();
+    expect(screen.getByText('模拟回放·不计入生产验收')).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText('管号 / 记录号'), { target: { value: '202606131900' } });
     fireEvent.change(screen.getByLabelText('状态'), { target: { value: 'detecting' } });
@@ -2421,6 +2521,9 @@ describe('ParameterManagementApp', () => {
     expect(within(panel).queryByText('C8')).not.toBeInTheDocument();
     expect(within(panel).getByText('10 / 11 已转换')).toBeInTheDocument();
     expect(within(panel).getByText('隔离 1')).toBeInTheDocument();
+    expect(within(panel).getByRole('radio', { name: /在线/ })).toBeDisabled();
+    expect(within(panel).getByRole('radio', { name: /模拟/ })).toBeDisabled();
+    expect(within(panel).getByText(/当前站点无六相机采集管线/)).toBeInTheDocument();
   });
 
   it('keeps runtime configuration editable when the optional converter status is unavailable', async () => {
@@ -2435,21 +2538,82 @@ describe('ParameterManagementApp', () => {
     expect(within(panel).getByText('转换服务状态暂不可用')).toBeInTheDocument();
   });
 
-  it('validates and saves runtime configuration with a persistent restart message', async () => {
+  it('validates, saves, and observes the server-owned runtime mode transition', async () => {
+    setAdminOverviewSiteMode('direct-camera');
+    runtimeProfileResponse = adminDirectRuntimeProfile;
     render(<ParameterManagementApp />);
 
     expect(await screen.findByText('系统管理员')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
-    const sourceInput = await screen.findByLabelText('BKV 源目录');
-    fireEvent.change(sourceInput, { target: { value: 'tmp/legacy-bkv-new' } });
+    fireEvent.click(await screen.findByRole('radio', { name: /模拟/ }));
+    expect(screen.getByLabelText('模拟播放速度')).toHaveAttribute('min', '0.25');
+    expect(screen.getByLabelText('模拟播放速度')).toHaveAttribute('max', '4');
+    expect(screen.getByLabelText('模拟批次间隔毫秒')).toHaveAttribute('min', '1001');
+    fireEvent.change(screen.getByLabelText('模拟数据目录'), { target: { value: 'H:/captured-data' } });
+    fireEvent.change(screen.getByLabelText('模拟播放速度'), { target: { value: '2.5' } });
+    fireEvent.change(screen.getByLabelText('模拟批次间隔毫秒'), { target: { value: '1750' } });
+    fireEvent.click(screen.getByLabelText('模拟循环播放'));
     fireEvent.click(screen.getByRole('button', { name: '校验运行配置' }));
     expect(await screen.findByText('配置校验通过')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '保存运行配置' }));
-    expect(await screen.findByText('配置已保存，重启后生效')).toBeInTheDocument();
+    expect(await screen.findByText('已应用模拟（数据回放），运行服务切换完成')).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:4873/api/admin/runtime-profile',
       expect.objectContaining({ method: 'POST' }),
     );
+    const saveRequest = fetchMock.mock.calls
+      .filter(([url, init]) => String(url).endsWith('/api/admin/runtime-profile') && init?.method === 'POST')
+      .at(-1);
+    const savedCandidate = JSON.parse(String(saveRequest?.[1]?.body)).profile;
+    expect(savedCandidate).toMatchObject({
+      acquisitionMode: 'simulation',
+      provider: 'external-api',
+      dataSource: 'online-production',
+      cameraConnection: 'headless-cpp',
+      simulation: {
+        sourceRoot: 'H:/captured-data',
+        speed: 2.5,
+        loop: true,
+        interSessionGapMs: 1750,
+      },
+    });
+    expect(savedCandidate.provider).toBe(adminDirectRuntimeProfile.savedProfile.provider);
+    expect(savedCandidate.dataSource).toBe(adminDirectRuntimeProfile.savedProfile.dataSource);
+    expect(savedCandidate.cameraConnection).toBe(adminDirectRuntimeProfile.savedProfile.cameraConnection);
+
+    expect(screen.queryByRole('button', { name: '应用并重启运行服务' })).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4899/api/status',
+      expect.objectContaining({ method: 'GET' }),
+    );
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith('http://127.0.0.1:4899/api/services/'))).toBe(false);
+
+    fireEvent.click(screen.getByRole('radio', { name: /在线/ }));
+    fireEvent.click(screen.getByRole('button', { name: '保存运行配置' }));
+    expect(await screen.findByText('已应用在线（真实相机），运行服务切换完成')).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith('http://127.0.0.1:4899/api/services/'))).toBe(false);
+  });
+
+  it('keeps polling a recoverable 202 mode transition instead of treating it as no restart', async () => {
+    setAdminOverviewSiteMode('direct-camera');
+    runtimeProfileResponse = adminDirectRuntimeProfile;
+    runtimeProfileSaveRequiresRecovery = true;
+    render(<ParameterManagementApp />);
+
+    expect(await screen.findByText('系统管理员')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '全局配置' }));
+    fireEvent.click(await screen.findByRole('radio', { name: /模拟/ }));
+    fireEvent.change(screen.getByLabelText('模拟数据目录'), {
+      target: { value: 'H:/captured-data' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存运行配置' }));
+
+    expect(await screen.findByText('已应用模拟（数据回放），运行服务切换完成')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:4899/api/status',
+      expect.objectContaining({ method: 'GET' }),
+    );
+    expect(screen.queryByText('配置已保存，当前运行服务无需切换')).not.toBeInTheDocument();
   });
 
   it('shows validation details and does not save an invalid runtime profile', async () => {

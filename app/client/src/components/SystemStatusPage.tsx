@@ -12,9 +12,11 @@ import {
   Gauge,
   ListChecks,
   Network,
+  Pause,
   Play,
   Power,
   RefreshCw,
+  RotateCcw,
   Save,
   Settings2,
   SlidersHorizontal,
@@ -23,7 +25,8 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DeviceStatus } from '../data/inspection';
 import { openBarSurfaceWindow, openCaptureManagementWindow } from '../lib/app-windows';
-import type { RuntimeCapabilities } from '../services/runtime-profile-api';
+import type { AcquisitionMode } from '../lib/acquisition-mode';
+import type { PublicRuntimeSimulationConfig, RuntimeCapabilities } from '../services/runtime-profile-api';
 import {
   captureProductionOnce,
   fetchProductionStatus,
@@ -51,12 +54,17 @@ import {
   openCaptureLocalPath,
   readCaptureCameraStatuses,
   readCaptureContinuousSettings,
+  readCaptureSimulationStatus,
   readLatestCaptureFile,
   setCaptureParam,
   setCaptureSoftwareTrigger,
   saveCapturePreviewFromUrl,
+  pauseCaptureSimulation,
+  resetCaptureSimulation,
+  resumeCaptureSimulation,
   setCaptureOutputMode as applyCaptureOutputMode,
   startCaptureStream,
+  startCaptureSimulation,
   stopCaptureStream,
   validateCaptureContinuousSettings,
   validateCaptureStreamStartOptions,
@@ -69,6 +77,7 @@ import {
   type CaptureLogEvent,
   type CaptureOutputMode,
   type CaptureSnapshot,
+  type CaptureSimulationStatus,
   type CaptureStreamStartOptions,
 } from '../lib/capture-api';
 import type { OperationState, SystemAction } from '../state/operations';
@@ -350,11 +359,176 @@ function getFrameDropReview(status: CaptureCameraStatus) {
 }
 
 function isSimulationCapture(capture: CaptureSnapshot) {
+  // Formal data replay is identified only by the acquisition runtime mode.
+  // The development connection can still use a simulated provider while the
+  // formal mode remains online, and must not acquire replay semantics.
+  return Boolean(
+    capture.health
+      && 'runtimeMode' in capture.health
+      && capture.health.runtimeMode === 'simulation',
+  );
+}
+
+function simulationProgressPercent(progress?: number | null) {
+  if (typeof progress !== 'number' || !Number.isFinite(progress)) return 0;
+  const percent = progress <= 1 ? progress * 100 : progress;
+  return Math.max(0, Math.min(100, percent));
+}
+
+function formatSimulationDuration(value?: number | null) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '--:--';
+  const seconds = Math.floor(value / 1000);
+  return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
+}
+
+const simulationStateLabels: Record<CaptureSimulationStatus['state'], string> = {
+  idle: '待机',
+  running: '运行中',
+  paused: '已暂停',
+  completed: '已完成',
+  error: '异常',
+};
+
+export function SimulationControlPanel({
+  initialStatus = null,
+  simulationConfig,
+}: {
+  initialStatus?: CaptureSimulationStatus | null;
+  simulationConfig?: PublicRuntimeSimulationConfig;
+}) {
+  const [simulation, setSimulation] = useState<CaptureSimulationStatus | null>(initialStatus);
+  const [speed, setSpeed] = useState(simulationConfig?.speed ?? initialStatus?.speed ?? 1);
+  const [loop, setLoop] = useState(simulationConfig?.loop ?? initialStatus?.loop ?? false);
+  const [gapMs, setGapMs] = useState(simulationConfig?.interSessionGapMs ?? initialStatus?.sessionGapMs ?? 1_500);
+  const [busyAction, setBusyAction] = useState('');
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (initialStatus) setSimulation(initialStatus);
+  }, [initialStatus]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let polling = false;
+    const refresh = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const next = await readCaptureSimulationStatus(controller.signal);
+        if (!controller.signal.aborted) {
+          setSimulation(next);
+          setError('');
+        }
+      } catch (nextError) {
+        if (!controller.signal.aborted) {
+          setError(nextError instanceof Error ? nextError.message : '模拟采集状态读取失败');
+        }
+      } finally {
+        polling = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const runControl = async (
+    action: 'start' | 'pause' | 'resume' | 'reset',
+    request: () => Promise<CaptureSimulationStatus>,
+  ) => {
+    setBusyAction(action);
+    setMessage('');
+    setError('');
+    try {
+      const next = await request();
+      setSimulation(next);
+      setMessage(action === 'start' ? '模拟采集已启动' : action === 'pause' ? '模拟采集已暂停' : action === 'resume' ? '模拟采集已恢复' : '模拟采集已复位');
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : '模拟采集控制失败');
+    } finally {
+      setBusyAction('');
+    }
+  };
+
+  const progress = simulationProgressPercent(simulation?.progress);
+  const sourceAvailable = simulation?.sourceAvailable ?? simulationConfig?.configured ?? false;
+  const state = simulation?.state ?? 'idle';
+  const channels = simulation?.channels ?? [];
+
   return (
-    capture.health?.driverId === 'simulated' ||
-    capture.health?.service?.includes('simulated') ||
-    capture.cameras.some((camera) => camera.driverId === 'simulated' || camera.source === 'service-fallback') ||
-    capture.statuses.some((camera) => camera.driverId === 'simulated' || camera.sdkStatus === 'simulation')
+    <section className="simulation-control-panel" aria-label="模拟采集控制">
+      <header>
+        <div>
+          <span>模拟采集</span>
+          <strong>{simulationStateLabels[state]}</strong>
+        </div>
+        <em className={sourceAvailable ? 'ready' : 'warning'}>{sourceAvailable ? '数据源就绪' : '数据源不可用'}</em>
+      </header>
+      <div className="simulation-source-summary">
+        <span>数据目录</span>
+        <strong title={simulation?.sourceRoot || undefined}>{simulation?.sourceRoot || (simulationConfig?.configured ? '已配置（路径受保护）' : '未配置')}</strong>
+        <dl className="simulation-source-evidence">
+          <div>
+            <dt>数据集 ID</dt>
+            <dd title={simulation?.sourceDatasetId || undefined}>{simulation?.sourceDatasetId || '--'}</dd>
+          </div>
+          <div>
+            <dt>当前会话</dt>
+            <dd title={simulation?.currentSessionId || undefined}>{simulation?.currentSessionId || '--'}</dd>
+          </div>
+          <div>
+            <dt>可用会话</dt>
+            <dd>
+              {simulation?.usableSessionCount ?? simulation?.sessionCount ?? 0}
+              {' / '}{simulation?.candidateSessionCount ?? simulation?.sessionCount ?? 0}
+            </dd>
+          </div>
+          <div>
+            <dt>拒绝项</dt>
+            <dd>{simulation?.rejectedSessionCount ?? 0} 会话 · {simulation?.rejectedTrackCount ?? 0} 通道</dd>
+          </div>
+        </dl>
+        <em>已采集数据仅作为模拟输入，不计入物理相机在线数</em>
+      </div>
+      <div className="simulation-progress" aria-label={`模拟进度 ${Math.round(progress)}%`}>
+        <div><span>播放进度</span><strong>{Math.round(progress)}%</strong></div>
+        <i style={{ '--simulation-progress': `${progress}%` } as React.CSSProperties} />
+        <p>
+          {formatSimulationDuration(simulation?.positionMs)} / {formatSimulationDuration(simulation?.durationMs)}
+          {' · '}批次 {simulation?.currentSessionIndex != null && simulation.currentSessionIndex >= 0 ? simulation.currentSessionIndex + 1 : 0}/{simulation?.sessionCount ?? 0}
+          {simulation?.currentCoilId ? ` · ${simulation.currentCoilId}` : ''}
+        </p>
+      </div>
+      <div className="simulation-control-settings">
+        <label><span>播放速度</span><input aria-label="模拟控制播放速度" type="number" min={0.25} max={4} step={0.25} value={speed} disabled={state === 'running'} onChange={(event) => setSpeed(Number(event.target.value))} /></label>
+        <label><span>批次间隔 ms</span><input aria-label="模拟控制批次间隔" type="number" min={1_001} max={3_600_000} step={100} value={gapMs} disabled={state === 'running'} onChange={(event) => setGapMs(Number(event.target.value))} /></label>
+        <label className="simulation-loop-control"><input aria-label="模拟控制循环播放" type="checkbox" checked={loop} disabled={state === 'running'} onChange={(event) => setLoop(event.target.checked)} /><span>循环播放</span></label>
+      </div>
+      <div className="simulation-control-actions">
+        <button type="button" className="primary" disabled={Boolean(busyAction) || !sourceAvailable || state === 'running'} onClick={() => void runControl('start', () => startCaptureSimulation({ speed, loop, sessionGapMs: gapMs }))}><Play size={15} />启动</button>
+        <button type="button" disabled={Boolean(busyAction) || state !== 'running'} onClick={() => void runControl('pause', () => pauseCaptureSimulation())}><Pause size={15} />暂停</button>
+        <button type="button" disabled={Boolean(busyAction) || state !== 'paused'} onClick={() => void runControl('resume', () => resumeCaptureSimulation())}><Play size={15} />继续</button>
+        <button type="button" disabled={Boolean(busyAction) || state === 'idle'} onClick={() => void runControl('reset', () => resetCaptureSimulation())}><RotateCcw size={15} />复位</button>
+      </div>
+      {channels.length ? (
+        <div className="simulation-channel-grid" aria-label="模拟通道状态">
+          {channels.map((channel) => (
+            <div key={`${channel.cameraId}-${channel.cameraKey}`}>
+              <strong>{channel.cameraKey || `模拟通道 ${channel.cameraId}`}</strong>
+              <span>模拟通道 · {channel.sourceFlow || '数据回放'}</span>
+              <em>{channel.frameIndex >= 0 ? channel.frameIndex + 1 : 0}/{channel.frameCount} 帧</em>
+            </div>
+          ))}
+        </div>
+      ) : <div className="simulation-empty-channels">等待模拟数据集提供通道</div>}
+      {simulation?.lastError ? <p className="simulation-control-error">{simulation.lastError}</p> : null}
+      {error ? <p className="simulation-control-error" role="alert">{error}</p> : null}
+      {message ? <p className="simulation-control-message" role="status">{message}</p> : null}
+    </section>
   );
 }
 
@@ -585,6 +759,8 @@ export function CaptureManagementApp({
   operation,
   capture,
   expectedCameraCount = capture.config?.cameras.length ?? capture.statuses.length,
+  acquisitionMode = 'online',
+  simulationConfig,
   onAction,
   className = '',
 }: {
@@ -592,6 +768,8 @@ export function CaptureManagementApp({
   operation: OperationState;
   capture: CaptureSnapshot;
   expectedCameraCount?: number;
+  acquisitionMode?: AcquisitionMode;
+  simulationConfig?: PublicRuntimeSimulationConfig;
   onAction: (action: SystemAction) => void;
   className?: string;
 }) {
@@ -600,6 +778,7 @@ export function CaptureManagementApp({
     : Math.max(1, capture.config?.cameras.length ?? capture.statuses.length);
   const showReturnToTerminal = className.split(/\s+/).includes('standalone-capture-manager');
   const embeddedMode = className.split(/\s+/).includes('embedded-capture-manager');
+  const simulationMode = acquisitionMode === 'simulation' || isSimulationCapture(capture);
   const [activeView, setActiveView] = useState<CaptureView>('overview');
   const [selectedIp, setSelectedIp] = useState<string | null>(null);
   const [detailTab, setDetailTab] = useState<CaptureDetailTab>('status');
@@ -672,6 +851,7 @@ export function CaptureManagementApp({
   }, [capture.statuses]);
 
   useEffect(() => {
+    if (simulationMode) return undefined;
     let cancelled = false;
     let requestRunning = false;
     const refresh = async () => {
@@ -697,7 +877,7 @@ export function CaptureManagementApp({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [simulationMode]);
 
   const syncProductionDraftFromStatus = useCallback(
     (nextStatus: ProductionStatus) => {
@@ -723,6 +903,7 @@ export function CaptureManagementApp({
   }, [syncProductionDraftFromStatus]);
 
   useEffect(() => {
+    if (simulationMode) return undefined;
     let cancelled = false;
     const refresh = async () => {
       try {
@@ -743,7 +924,7 @@ export function CaptureManagementApp({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [syncProductionDraftFromStatus]);
+  }, [simulationMode, syncProductionDraftFromStatus]);
 
   const refreshContinuousSettings = useCallback(async () => {
     const result = await readCaptureContinuousSettings();
@@ -755,6 +936,7 @@ export function CaptureManagementApp({
   }, []);
 
   useEffect(() => {
+    if (simulationMode) return undefined;
     let cancelled = false;
     const refresh = async () => {
       try {
@@ -773,7 +955,7 @@ export function CaptureManagementApp({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [simulationMode]);
 
   const refreshTriggerGatewayStatus = useCallback(async () => {
     const nextStatus = await fetchTriggerGatewayStatus();
@@ -786,6 +968,7 @@ export function CaptureManagementApp({
   }, []);
 
   useEffect(() => {
+    if (simulationMode) return undefined;
     let cancelled = false;
     const refresh = async () => {
       try {
@@ -809,7 +992,7 @@ export function CaptureManagementApp({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [simulationMode]);
 
   const overviewStatuses = useMemo(() => {
     const statusesByIp = new Map(liveCameraStatuses.map((item) => [item.ip, item]));
@@ -846,7 +1029,9 @@ export function CaptureManagementApp({
     () => mergeCaptureLogEvents(capture.logs, operation.events, clientOperationLogs),
     [capture.logs, clientOperationLogs, operation.events],
   );
-  const simulationMode = isSimulationCapture(capture);
+  const initialSimulationStatus = capture.health && 'simulation' in capture.health
+    ? capture.health.simulation ?? null
+    : null;
   const continuousSettingsIps = useMemo(
     () => overviewStatuses
       .filter((item) => item.enabled !== false && item.connected)
@@ -1570,7 +1755,7 @@ export function CaptureManagementApp({
         <section className="production-site-simulation" aria-label="模拟现场运行">
           <div>
             <span>模拟现场运行</span>
-            <strong>{simulationMode ? '模拟相机数据源' : `当前 ${connectedCount}/${enabledCount} 台真实相机`}</strong>
+            <strong>{simulationMode ? '模拟通道数据源' : `当前 ${connectedCount}/${enabledCount} 台真实相机`}</strong>
             <em>{siteSimulationPhase}</em>
           </div>
           <button
@@ -2208,7 +2393,7 @@ export function CaptureManagementApp({
               </a>
             ) : null}
           </div>
-          {captureViews.map((item) => {
+          {captureViews.filter((item) => !simulationMode || item.id === 'overview' || item.id === 'logs').map((item) => {
             const Icon = item.icon;
             return (
               <button
@@ -2233,45 +2418,45 @@ export function CaptureManagementApp({
                 <AlertTriangle size={18} />
                 <div>
                   <strong>模拟模式</strong>
-                  <span>当前采集数据来自服务兜底模拟，不是相机 SDK 的真实采集结果。</span>
+                  <span>当前使用已采集数据模拟生产运行；模拟通道与物理相机状态严格分离。</span>
                 </div>
               </div>
             ) : null}
             <div className="capture-workflow">
-              <span>选择配置</span>
+              <span>{simulationMode ? '读取数据集' : '选择配置'}</span>
               <i />
-              <span>应用配置</span>
+              <span>{simulationMode ? '启动模拟' : '应用配置'}</span>
               <i />
-              <span>相机总览</span>
+              <span>{simulationMode ? '通道进度' : '相机总览'}</span>
               <i />
-              <span>进入详情</span>
+              <span>{simulationMode ? '完成/循环' : '进入详情'}</span>
             </div>
             <div className="capture-status-strip">
               <div>
-                <span>当前配置</span>
-                <strong>{localConfig.name}</strong>
+                <span>{simulationMode ? '运行模式' : '当前配置'}</span>
+                <strong>{simulationMode ? '模拟' : localConfig.name}</strong>
               </div>
               <div>
-                <span>应用状态</span>
-                <strong>{localConfig.applied && !configDirty ? '已应用' : '待应用'}</strong>
+                <span>{simulationMode ? '数据源' : '应用状态'}</span>
+                <strong>{simulationMode ? (initialSimulationStatus?.sourceAvailable || simulationConfig?.configured ? '已配置' : '未就绪') : localConfig.applied && !configDirty ? '已应用' : '待应用'}</strong>
               </div>
               <div>
-                <span>在线相机</span>
+                <span>{simulationMode ? '模拟通道' : '在线相机'}</span>
                 <strong>
-                  {connectedCount}/{enabledCount}
+                  {simulationMode ? initialSimulationStatus?.channels.length ?? 0 : `${connectedCount}/${enabledCount}`}
                 </strong>
               </div>
               <div>
-                <span>采集状态</span>
-                <strong>{captureRunning ? '运行' : '待机'}</strong>
+                <span>{simulationMode ? '模拟状态' : '采集状态'}</span>
+                <strong>{simulationMode ? simulationStateLabels[initialSimulationStatus?.state ?? 'idle'] : captureRunning ? '运行' : '待机'}</strong>
               </div>
               <div>
-                <span>SDK</span>
-                <strong>{capture.health?.sdkReady ? '正常' : '等待'}</strong>
+                <span>{simulationMode ? '播放进度' : 'SDK'}</span>
+                <strong>{simulationMode ? `${Math.round(simulationProgressPercent(initialSimulationStatus?.progress))}%` : capture.health?.sdkReady ? '正常' : '等待'}</strong>
               </div>
               <div>
-                <span>报警</span>
-                <strong>{offlineCount + warningCount}</strong>
+                <span>{simulationMode ? '物理相机' : '报警'}</span>
+                <strong>{simulationMode ? '未启用' : offlineCount + warningCount}</strong>
               </div>
             </div>
           </header> : null}
@@ -2283,7 +2468,22 @@ export function CaptureManagementApp({
             </div>
           ) : null}
 
-          {selectedIp ? (
+          {simulationMode ? (
+            activeView === 'logs' ? (
+              <Panel title="模拟采集日志" className="capture-log-panel">
+                <div className="capture-event-list">
+                  {recentLogs.map((event) => (
+                    <div key={`${event.source || 'unknown'}-${event.id}`} className={event.level}>
+                      <Activity size={15} />
+                      <span>{formatTime(event.time)}</span>
+                      <em>{captureLogSourceLabel(event.source)}</em>
+                      <strong>{event.message}</strong>
+                    </div>
+                  ))}
+                </div>
+              </Panel>
+            ) : <SimulationControlPanel initialStatus={initialSimulationStatus} simulationConfig={simulationConfig} />
+          ) : selectedIp ? (
             renderDetail()
           ) : activeView === 'overview' ? (
             renderOverview()
@@ -2544,6 +2744,8 @@ export function SystemStatusPage({
   status,
   operation,
   capture,
+  acquisitionMode = 'online',
+  simulationConfig,
   capabilities = {
     directCamera: true,
     captureManagement: true,
@@ -2557,6 +2759,8 @@ export function SystemStatusPage({
   operation: OperationState;
   capture: CaptureSnapshot;
   expectedCameraCount?: number;
+  acquisitionMode?: AcquisitionMode;
+  simulationConfig?: PublicRuntimeSimulationConfig;
   capabilities?: RuntimeCapabilities;
   cameraCount?: number;
   onAction: (action: SystemAction) => void;
@@ -2584,16 +2788,19 @@ export function SystemStatusPage({
     () => mergeCaptureLogEvents(capture.logs, operation.events),
     [capture.logs, operation.events],
   );
-  const simulationMode = isSimulationCapture(capture);
+  const simulationMode = acquisitionMode === 'simulation' || isSimulationCapture(capture);
+  const initialSimulationStatus = capture.health && 'simulation' in capture.health
+    ? capture.health.simulation ?? null
+    : null;
 
-  if (!capabilities.captureManagement) {
+  if (acquisitionMode === 'offline' || !capabilities.captureManagement) {
     return (
       <main className="workspace-page capture-terminal-page runtime-capability-summary">
         <section className="mode-error-panel">
           <span>当前运行模式</span>
           <h1>离线运行状态</h1>
           <p>{cameraCount} 路配置相机</p>
-          <p>当前数据源不直接连接相机，硬件采集与三维重建功能未加载。</p>
+          <p>当前不启动采集；历史查询、缺陷复核、报告和配置业务保持可用。</p>
         </section>
       </main>
     );
@@ -2623,24 +2830,24 @@ export function SystemStatusPage({
         <div className="capture-terminal-embed-bar">
           <div className="capture-terminal-embed-heading">
             <span>终端内嵌模式</span>
-            <strong>真实采集管理界面</strong>
+            <strong>{simulationMode ? '模拟采集管理界面' : '真实采集管理界面'}</strong>
           </div>
           <div className="capture-terminal-embed-workflow" aria-label="采集配置流程">
-            <span>选择配置</span>
+            <span>{simulationMode ? '读取数据集' : '选择配置'}</span>
             <i />
-            <span>应用配置</span>
+            <span>{simulationMode ? '启动模拟' : '应用配置'}</span>
             <i />
-            <span>相机总览</span>
+            <span>{simulationMode ? '通道进度' : '相机总览'}</span>
             <i />
-            <span>进入详情</span>
+            <span>{simulationMode ? '完成/循环' : '进入详情'}</span>
           </div>
           <div className="capture-terminal-embed-status" aria-label="采集状态摘要">
             <span title={config.name}>配置 <strong>{config.name}</strong></span>
             <span>应用 <strong>{config.applied ? '已应用' : '待应用'}</strong></span>
-            <span>相机 <strong>{connectedCount}/{enabledCount}</strong></span>
-            <span>采集 <strong>{captureRunning ? '运行' : '待机'}</strong></span>
-            <span>SDK <strong>{capture.health?.sdkReady ? '正常' : '等待'}</strong></span>
-            <span>报警 <strong>{offlineCount + warningCount}</strong></span>
+            <span>{simulationMode ? '模拟通道' : '相机'} <strong>{simulationMode ? initialSimulationStatus?.channels.length ?? 0 : `${connectedCount}/${enabledCount}`}</strong></span>
+            <span>{simulationMode ? '模拟' : '采集'} <strong>{simulationMode ? simulationStateLabels[initialSimulationStatus?.state ?? 'idle'] : captureRunning ? '运行' : '待机'}</strong></span>
+            <span>{simulationMode ? '进度' : 'SDK'} <strong>{simulationMode ? `${Math.round(simulationProgressPercent(initialSimulationStatus?.progress))}%` : capture.health?.sdkReady ? '正常' : '等待'}</strong></span>
+            <span>{simulationMode ? '物理相机' : '报警'} <strong>{simulationMode ? '未启用' : offlineCount + warningCount}</strong></span>
             {simulationMode ? <em>模拟</em> : null}
           </div>
           <button type="button" onClick={() => setEmbeddedManager(false)}>
@@ -2653,6 +2860,8 @@ export function SystemStatusPage({
           operation={operation}
           capture={capture}
           expectedCameraCount={cameraCount}
+          acquisitionMode={acquisitionMode}
+          simulationConfig={simulationConfig}
           onAction={onAction}
           className="embedded-capture-manager"
         />
@@ -2669,11 +2878,11 @@ export function SystemStatusPage({
               <AlertTriangle size={18} />
               <div>
                 <strong>模拟模式</strong>
-                <span>当前状态由服务 fallback 生成，真实相机采集服务尚未接管。</span>
+                <span>当前使用已采集数据模拟生产运行；模拟通道不代表物理相机在线。</span>
               </div>
             </div>
           ) : null}
-          <div className="capture-terminal-summary">
+          {simulationMode ? <SimulationControlPanel initialStatus={initialSimulationStatus} simulationConfig={simulationConfig} /> : <div className="capture-terminal-summary">
             <div>
               <span>当前配置</span>
               <strong>{config.name}</strong>
@@ -2692,8 +2901,8 @@ export function SystemStatusPage({
               <span>异常</span>
               <strong>{offlineCount + warningCount + status.alarmCount}</strong>
             </div>
-          </div>
-          <div className="capture-terminal-camera-list">
+          </div>}
+          {!simulationMode ? <div className="capture-terminal-camera-list">
             {overviewStatuses.map((camera) => (
               <button key={`${camera.configId}-${camera.ip}`} type="button" onClick={() => setEmbeddedManager(true)}>
                 <i className={getStatusTone(camera)} />
@@ -2702,7 +2911,7 @@ export function SystemStatusPage({
                 <em>{getStatusLabel(camera)}</em>
               </button>
             ))}
-          </div>
+          </div> : null}
         </Panel>
 
         <Panel title="采集管理入口" className="capture-terminal-entry-panel">
@@ -2713,7 +2922,7 @@ export function SystemStatusPage({
             </button>
             <button type="button" onClick={() => setEmbeddedManager(true)}>
               <Gauge size={16} />
-              内嵌真实管理界面
+              内嵌{simulationMode ? '模拟' : '真实'}管理界面
             </button>
             {capabilities.reconstruction ? (
               <button type="button" onClick={openBarSurfaceWorkbench}>

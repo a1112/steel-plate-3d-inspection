@@ -119,6 +119,34 @@ describe('SettingsPage', () => {
     expect(onConnectionSave).toHaveBeenCalledTimes(1);
   });
 
+  it('labels developer online/demo connectivity separately from acquisition simulation', () => {
+    const settings = createDefaultSettings();
+    const onConnectionChange = vi.fn();
+    render(
+      <SettingsPage
+        embedded
+        initialSection="connection"
+        theme="light"
+        draft={settings}
+        saved={settings}
+        errors={{}}
+        connection={{ mode: 'demo', host: '127.0.0.1', port: 4873, protocol: 'http' }}
+        onThemeChange={vi.fn()}
+        onDraftChange={vi.fn()}
+        onConnectionChange={onConnectionChange}
+        onSave={vi.fn()}
+        onReset={vi.fn()}
+        onApplyToPlate={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('group', { name: '开发服务连接模式' })).toBeInTheDocument();
+    expect(screen.getAllByText('开发演示（本地假数据，非采集模拟）')).toHaveLength(2);
+    expect(screen.getByText('客户端内置假数据（非采集模拟）')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '服务连接（在线 API）' }));
+    expect(onConnectionChange).toHaveBeenCalledWith({ mode: 'online' });
+  });
+
   it('renders connection actions in one group and tests without saving', () => {
     const settings = createDefaultSettings();
     const onConnectionTest = vi.fn();

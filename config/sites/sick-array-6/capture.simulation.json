@@ -1,0 +1,201 @@
+{
+  "schema": "steel.capture.profile.v2",
+  "name": "sick-array-6-simulation",
+  "driverMode": "sick-gentl",
+  "storageRoot": "H:\\steel-simulation-output",
+  "autoConnect": true,
+  "expectedCameras": 6,
+  "sick": {
+    "ctiPath": "C:\\Program Files\\SICK\\EasyRanger Program Editor\\SICKGigEVisionTL.cti",
+    "ctiSha256": "14b17b2581f4b082e16f1287e2220cdbff54b77404197f8d1350799de85d6707",
+    "deviceScanType": "Linescan3D",
+    "expectedDepthFormats": [
+      "Coord3D_C16"
+    ],
+    "expectedIntensityFormats": [
+      "Mono8"
+    ]
+  },
+  "captureDefaults": {
+    "timeoutMs": 8000,
+    "frameTriggerMode": "free-run",
+    "synchronizationMaximumSequenceSkew": 1,
+    "captureMode": "continuous",
+    "discardBlackFrames": true,
+    "blackFrameThreshold": 1,
+    "grayscaleSteelDetection": true,
+    "steelBrightPixelThreshold": 8,
+    "steelBrightPixelRatio": 0.02,
+    "steelDetectionEdge": "bottom",
+    "steelDetectionTailRows": 32,
+    "steelDetectionCameraKeys": [
+      "C4"
+    ],
+    "steelMinCameras": 1,
+    "steelEntryRounds": 1,
+    "steelExitRounds": 1,
+    "steelPreRollFrames": 0,
+    "steelPostRollFrames": 1,
+    "blackFrameCacheRounds": 8,
+    "perCameraFlowRouting": true,
+    "cameraMaterialSignalRatio": 0.005,
+    "cameraBoundaryBufferRounds": 16,
+    "cameraBoundaryCloseTimeoutRounds": 24,
+    "imageQualitySampleStep": 8,
+    "imageQualityAlarmRounds": 12,
+    "imageQualityRecoveryRounds": 8,
+    "imageQualityBaselineRounds": 8,
+    "imageQualityRelativeSignalRatio": 0.2,
+    "imageQualityMinimumDynamicRange": 4,
+    "imageQualityMaximumSaturationRatio": 0.98,
+    "cameraOfflineAlarmRounds": 1,
+    "cameraReconnectIntervalSeconds": 3,
+    "alignmentSearchFrames": 32,
+    "alignmentStableRows": 8,
+    "alignmentSampleStep": 4,
+    "alignmentDepthValidRatio": 0.005,
+    "softSyncAnchorIntervalFrames": 4,
+    "softSyncMaximumResidualMs": 40,
+    "arrayCalibrationPath": "../../capture/calibrations/beiman-sick-6-20260612/array-calibration.json",
+    "measurementRowWindow": 16,
+    "measurementMaximumProfilePoints": 320,
+    "measurementMaximumSections": 0,
+    "measurementMinimumCirclePoints": 48,
+    "measurementMinimumCameraProfilePoints": 8,
+    "measurementMaximumCircleResidualMm": 1,
+    "defectDetectionEnabled": true,
+    "defectRequireApprovedRegionMap": true,
+    "defectModelManifestPath": "../../../models/beiman-temporary/legacy-yolov5/model-set.json",
+    "defectModel2dPath": "../../../models/beiman-temporary/legacy-yolov5/surface-defect-2d.onnx",
+    "defectModel3dPath": "../../../models/beiman-temporary/legacy-yolov5/surface-defect-3d.onnx",
+    "defectClassifier2dPath": "../../../models/beiman-temporary/legacy-yolov5/surface-classifier-2d.onnx",
+    "defectClassifier3dPath": "../../../models/beiman-temporary/legacy-yolov5/surface-classifier-3d.onnx",
+    "defectImageSize": 640,
+    "defectConfidenceThreshold": 0.5,
+    "defectClassificationConfidenceThreshold": 0.55,
+    "defectIouThreshold": 0.25,
+    "defectMergeIouThreshold": 0.2,
+    "defectMaximumPerFrame": 100,
+    "defectInferenceBatchSize": 8,
+    "defectPreprocessWorkers": 8,
+    "defectFrameStride": 1,
+    "defectCpuFrameStride": 8,
+    "defectGpuDevice": 1,
+    "defectDepthExposure": 300,
+    "defectDepthBaselineSampleStep": 4,
+    "defectReviewCropMinimumSize": 64,
+    "defectMaximumIdleWaitSeconds": 300,
+    "defectMaximumPendingStorageRounds": 128,
+    "gentlBufferCount": 64,
+    "gentlBackgroundAcquisition": false,
+    "startupCaptureRetries": 1,
+    "storageProcessWorkers": 6,
+    "storageRoundWorkers": 2,
+    "previewWorkerThreads": 1,
+    "storageWriteCacheRounds": 128
+  },
+  "compatibility": {
+    "lg3d": true,
+    "jpegQuality": 95,
+    "fsync": false,
+    "metadataCommitLast": true
+  },
+  "cameras": [
+    {
+      "cameraIndex": 1,
+      "id": "C1",
+      "key": "C1",
+      "serialNumber": "25440062",
+      "model": "Ranger3-60",
+      "firmware": "FW:3.1.0.12065,FPGA:3.1.3703 (RELEASE 20220520T12:24Z+02 rev: 6cf97c36029a8f24c0b706081b9612937081ac7a)",
+      "ip": "192.168.101.144",
+      "role": "sick-405-1",
+      "storageRoot": "H:\\steel-simulation-output\\C1",
+      "enabled": true,
+      "nodeOverrides": {
+        "AcquisitionFrameRate": 4,
+        "AcquisitionLineRate": 4000
+      }
+    },
+    {
+      "cameraIndex": 2,
+      "id": "C2",
+      "key": "C2",
+      "serialNumber": "25440064",
+      "model": "Ranger3-60",
+      "firmware": "FW:3.1.0.12065,FPGA:3.1.3703 (RELEASE 20220520T12:24Z+02 rev: 6cf97c36029a8f24c0b706081b9612937081ac7a)",
+      "ip": "192.168.102.206",
+      "role": "sick-520-2",
+      "storageRoot": "H:\\steel-simulation-output\\C2",
+      "enabled": true,
+      "nodeOverrides": {
+        "AcquisitionFrameRate": 4,
+        "AcquisitionLineRate": 4000
+      }
+    },
+    {
+      "cameraIndex": 3,
+      "id": "C3",
+      "key": "C3",
+      "serialNumber": "25440058",
+      "model": "Ranger3-60",
+      "firmware": "FW:3.1.0.12065,FPGA:3.1.3703 (RELEASE 20220520T12:24Z+02 rev: 6cf97c36029a8f24c0b706081b9612937081ac7a)",
+      "ip": "192.168.103.122",
+      "role": "sick-450-3",
+      "storageRoot": "H:\\steel-simulation-output\\C3",
+      "enabled": true,
+      "nodeOverrides": {
+        "AcquisitionFrameRate": 4,
+        "AcquisitionLineRate": 4000
+      }
+    },
+    {
+      "cameraIndex": 4,
+      "id": "C4",
+      "key": "C4",
+      "serialNumber": "25440053",
+      "model": "Ranger3-60",
+      "firmware": "FW:3.1.0.12065,FPGA:3.1.3703 (RELEASE 20220520T12:24Z+02 rev: 6cf97c36029a8f24c0b706081b9612937081ac7a)",
+      "ip": "192.168.104.228",
+      "role": "sick-405-4",
+      "storageRoot": "H:\\steel-simulation-output\\C4",
+      "enabled": true,
+      "nodeOverrides": {
+        "AcquisitionFrameRate": 4,
+        "AcquisitionLineRate": 4000
+      }
+    },
+    {
+      "cameraIndex": 5,
+      "id": "C5",
+      "key": "C5",
+      "serialNumber": "25440060",
+      "model": "Ranger3-60",
+      "firmware": "FW:3.1.0.12065,FPGA:3.1.3703 (RELEASE 20220520T12:24Z+02 rev: 6cf97c36029a8f24c0b706081b9612937081ac7a)",
+      "ip": "192.168.105.190",
+      "role": "sick-520-5",
+      "storageRoot": "H:\\steel-simulation-output\\C5",
+      "enabled": true,
+      "nodeOverrides": {
+        "AcquisitionFrameRate": 4,
+        "AcquisitionLineRate": 4000
+      }
+    },
+    {
+      "cameraIndex": 6,
+      "id": "C6",
+      "key": "C6",
+      "serialNumber": "25440059",
+      "model": "Ranger3-60",
+      "firmware": "FW:3.1.0.12065,FPGA:3.1.3703 (RELEASE 20220520T12:24Z+02 rev: 6cf97c36029a8f24c0b706081b9612937081ac7a)",
+      "ip": "192.168.106.219",
+      "role": "sick-450-6",
+      "storageRoot": "H:\\steel-simulation-output\\C6",
+      "enabled": true,
+      "nodeOverrides": {
+        "AcquisitionFrameRate": 4,
+        "AcquisitionLineRate": 4000
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@
   "schema": "steel.runtime-profile.v1",
   "id": "direct-8",
   "displayName": "八相机直连生产",
+  "acquisitionMode": "online",
   "provider": "headless-cpp",
   "dataSource": "online-production",
   "cameraConnection": "headless-cpp",

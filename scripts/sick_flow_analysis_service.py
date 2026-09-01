@@ -1543,7 +1543,10 @@ def main() -> int:
     args = parser.parse_args()
     process_priority = lower_process_priority()
 
-    profile = load_profile(args.profile)
+    # This process consumes already-persisted frames and never opens a camera
+    # transport. Requiring the GenTL producer here breaks offline/simulation
+    # processing on hosts that intentionally do not install the vendor SDK.
+    profile = load_profile(args.profile, strict_hardware=False, verify_cti=False)
     defaults = profile.raw.get("captureDefaults", {})
     camera_roots = {
         camera.camera_id: camera.storage_root for camera in profile.enabled_cameras

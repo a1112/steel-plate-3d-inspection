@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import App, { formatStorageBytes, formatStorageWarning } from './App';
+import App, { formatStorageBytes, formatStorageWarning, getSystemSelfCheckPlan } from './App';
 import { getMockInspectionSnapshot } from './data/inspection';
 
 const bkvRuntimeProfile = {
@@ -47,6 +47,25 @@ const directRuntimeProfile = {
     captureManagement: true,
     reconstruction: true,
     offlineReplay: false,
+  },
+};
+
+const directOfflineRuntimeProfile = {
+  ...directRuntimeProfile,
+  displayName: '八相机离线历史',
+  acquisitionMode: 'offline',
+};
+
+const directSimulationRuntimeProfile = {
+  ...directRuntimeProfile,
+  displayName: '六相机模拟回放',
+  provider: 'external-api',
+  acquisitionMode: 'simulation',
+  simulation: {
+    configured: true,
+    speed: 1,
+    loop: false,
+    interSessionGapMs: 1_500,
   },
 };
 
@@ -133,6 +152,29 @@ describe('storage capacity warning presentation', () => {
       freePercent: 7.25,
       estimatedRemainingSeconds: null,
     })).toBe('存储容量预警：剩余 8.0 GiB / 7.3%，预计 按当前吞吐暂无法估算');
+  });
+});
+
+describe('mode-aware system self-check planning', () => {
+  it('checks physical capture and trigger services only in online mode', () => {
+    expect(getSystemSelfCheckPlan('online')).toEqual({
+      targets: ['inspection', 'capture', 'trigger'],
+      successMessage: '系统自检已完成，Rust、采集和触发服务均可达',
+    });
+  });
+
+  it('checks only business history access in offline mode', () => {
+    expect(getSystemSelfCheckPlan('offline')).toEqual({
+      targets: ['inspection'],
+      successMessage: '系统自检已完成，业务与历史服务可达',
+    });
+  });
+
+  it('checks the replay source and processing chain without physical services in simulation mode', () => {
+    expect(getSystemSelfCheckPlan('simulation')).toEqual({
+      targets: ['inspection', 'simulation', 'processing'],
+      successMessage: '系统自检已完成，业务、模拟数据源和处理链均可达',
+    });
   });
 });
 
@@ -667,6 +709,53 @@ describe('App online severity filters', () => {
 });
 
 describe('App runtime capability routing', () => {
+  it('keeps direct offline business APIs active while suppressing capture polling and entry points', async () => {
+    window.history.replaceState(null, '', '/?app=terminal');
+    const requestedUrls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(directOfflineRuntimeProfile), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: '历史查看' })).toBeInTheDocument();
+    expect(screen.getByLabelText('运行模式：离线（历史模式）')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(requestedUrls.some((url) => url.includes('/api/inspection/snapshot'))).toBe(true);
+      expect(requestedUrls.some((url) => url.includes('/api/config/connection'))).toBe(true);
+      expect(requestedUrls.some((url) => url.includes('/api/inspection/settings'))).toBe(true);
+      expect(requestedUrls.some((url) => url.includes('/api/health/details'))).toBe(true);
+    });
+    expect(requestedUrls.some((url) => url.includes('/api/capture/health'))).toBe(false);
+    expect(requestedUrls.some((url) => url.includes('/api/trigger/status'))).toBe(false);
+    expect(screen.queryByText('采集工具')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '实时/回放' })).not.toBeInTheDocument();
+  });
+
+  it('keeps simulation replay controls separate from the physical production flow tool', async () => {
+    window.history.replaceState(null, '', '/?app=terminal');
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/runtime-profile')) {
+        return new Response(JSON.stringify(directSimulationRuntimeProfile), { status: 200 });
+      }
+      return new Response(JSON.stringify(getMockInspectionSnapshot()), { status: 200 });
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByLabelText('运行模式：模拟（数据回放）')).toBeInTheDocument();
+    expect(screen.queryByText('采集工具')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '更多功能' }));
+    expect(screen.queryByRole('menuitem', { name: '全流程' })).not.toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: '采集管理' })).toBeInTheDocument();
+  });
+
   it('redirects the capture deep link to the terminal when BKV disables capture management', async () => {
     window.history.replaceState(null, '', '/?app=capture');
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: RequestInfo | URL) => {

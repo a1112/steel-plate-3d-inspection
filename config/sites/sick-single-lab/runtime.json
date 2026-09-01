@@ -2,6 +2,7 @@
   "schema": "steel.runtime-profile.v1",
   "id": "sick-single-lab",
   "displayName": "SICK 单相机 GenTL 采集",
+  "acquisitionMode": "online",
   "provider": "external-api",
   "dataSource": "online-production",
   "cameraConnection": "headless-cpp",
