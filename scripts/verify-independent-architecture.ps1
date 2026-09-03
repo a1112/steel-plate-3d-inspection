@@ -302,14 +302,14 @@ function Assert-PackagedDatabaseMigrationContract {
   $MaxReadable = [long]$Contract.maxReadableSchemaVersion
   $RollbackReadableThrough = [long]$Contract.rollbackReadableThrough
   $ExpectedMaxUpgradeable = if ($SchemaVersion -gt $MinUpgradeable) { $SchemaVersion - 1 } else { $SchemaVersion }
-  if ($SchemaVersion -ne 5 -or
+  if ($SchemaVersion -ne 6 -or
       $MinUpgradeable -gt $MaxUpgradeable -or
       $MaxUpgradeable -ne $ExpectedMaxUpgradeable -or
       $MinReadable -gt $MaxReadable -or
       $MaxReadable -ne $SchemaVersion -or
       $RollbackReadableThrough -lt $MinReadable -or
       $RollbackReadableThrough -gt $SchemaVersion) {
-    throw 'Packaged database version ranges do not match the service schema v5 contract.'
+    throw 'Packaged database version ranges do not match the service schema v6 contract.'
   }
   $Engines = @($Contract.engines)
   if ($Engines.Count -ne 2 -or [string]$Engines[0] -cne 'sqlite' -or [string]$Engines[1] -cne 'mysql') {
@@ -681,8 +681,8 @@ function Test-PackagedRuntimeContract {
   $DatabaseContract = Assert-PackagedDatabaseMigrationContract `
     -PackageDir $PackageDir `
     -Database $Manifest.database
-  if ([long]$DatabaseContract.schemaVersion -ne 5) {
-    throw "Runtime package database contract does not match this verifier's service schema v5 boundary."
+  if ([long]$DatabaseContract.schemaVersion -ne 6) {
+    throw "Runtime package database contract does not match this verifier's service schema v6 boundary."
   }
   $PackagedSbomVerifier = Join-Path $PSScriptRoot 'verify-packaged-release-sbom.ps1'
   Assert-PowerShellScriptParses $PackagedSbomVerifier
@@ -1556,9 +1556,9 @@ $TrackedDatabaseReportText = (& $DatabaseContractVerifier `
   -IndexPath $TrackedDatabaseMigrationIndex | Out-String)
 $TrackedDatabaseReport = $TrackedDatabaseReportText | ConvertFrom-Json
 if ($TrackedDatabaseReport.code -ne 0 -or
-    [long]$TrackedDatabaseReport.schemaVersion -ne 5 -or
+    [long]$TrackedDatabaseReport.schemaVersion -ne 6 -or
     [int]$TrackedDatabaseReport.migrationCount -ne 0) {
-  throw "Tracked database contract/index must declare the current service schema v5 with no unsupported upgrade entries."
+  throw "Tracked database contract/index must declare the current service schema v6 with no unsupported upgrade entries."
 }
 $DatabaseContractTestText = (& $DatabaseContractTest | Out-String)
 $DatabaseContractTestReport = $DatabaseContractTestText | ConvertFrom-Json

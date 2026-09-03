@@ -333,7 +333,7 @@ $DatabaseContractReportText = (& $DatabaseContractVerifierPath `
 $DatabaseContractReport = $DatabaseContractReportText | ConvertFrom-Json
 if ($DatabaseContractReport.code -ne 0 -or
     [string]$DatabaseContractReport.schema -cne 'steel.database-contract-verification.v1' -or
-    [long]$DatabaseContractReport.schemaVersion -ne 5) {
+    [long]$DatabaseContractReport.schemaVersion -ne 6) {
   throw "Runtime package failed the database migration contract."
 }
 $AlgorithmTraceabilityTest = Join-Path $RuntimeRoot "scripts\test_algorithm_traceability.py"

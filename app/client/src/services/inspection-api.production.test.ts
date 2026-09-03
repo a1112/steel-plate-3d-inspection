@@ -238,7 +238,7 @@ describe('persistent production command client', () => {
         databaseEngine: 'sqlite',
         databaseStatus: 'up',
         databaseFallbackActive: false,
-        schemaVersion: 5,
+        schemaVersion: 6,
       },
       preferred: {
         host: '10.50.111.141',

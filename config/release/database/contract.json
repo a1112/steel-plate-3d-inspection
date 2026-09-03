@@ -1,13 +1,13 @@
 {
   "contractSchema": "steel.database-contract.v1",
-  "schemaVersion": 5,
-  "minUpgradeableSchemaVersion": 5,
-  "maxUpgradeableSchemaVersion": 5,
-  "minReadableSchemaVersion": 5,
-  "maxReadableSchemaVersion": 5,
-  "rollbackReadableThrough": 5,
+  "schemaVersion": 6,
+  "minUpgradeableSchemaVersion": 6,
+  "maxUpgradeableSchemaVersion": 6,
+  "minReadableSchemaVersion": 6,
+  "maxReadableSchemaVersion": 6,
+  "rollbackReadableThrough": 6,
   "engines": ["sqlite", "mysql"],
   "migrationIndex": "database/migrations/index.json",
-  "migrationIndexSha256": "a2d596224644a9d6a7ed59ecb49507b91a4be9769664127073d45e9b274396de",
+  "migrationIndexSha256": "09b62afb97bf46d8c9c14360f916a0f028997103903089de668474c2cd2ca4ea",
   "stateLayoutVersion": 1
 }

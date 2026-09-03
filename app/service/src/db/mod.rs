@@ -8203,7 +8203,7 @@ mod steel_flow_tests {
     }
 
     #[test]
-    fn schema_v5_adds_production_inspection_provenance_columns() {
+    fn schema_v6_adds_production_inspection_provenance_columns() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime.block_on(async {
             let database = Database::connect("sqlite::memory:")
