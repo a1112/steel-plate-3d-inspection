@@ -3,6 +3,7 @@ param()
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
 $Violations = [System.Collections.Generic.List[string]]::new()
+$Ripgrep = Get-Command rg -ErrorAction SilentlyContinue
 
 function Assert-Path {
   param([string]$RelativePath)
@@ -23,12 +24,33 @@ function Assert-NoPattern {
     $Violations.Add("cannot check missing path: $RelativePath")
     return
   }
-  $Matches = & rg -n --pcre2 $Pattern $Path
-  if ($LASTEXITCODE -eq 0) {
-    $Matches | ForEach-Object { Write-Host $_ }
+  if ($null -ne $Ripgrep) {
+    $RipgrepMatches = & $Ripgrep.Source -n --pcre2 $Pattern $Path
+    $ExitCode = $LASTEXITCODE
+    if ($ExitCode -eq 0) {
+      $RipgrepMatches | ForEach-Object { Write-Host $_ }
+      $Violations.Add($Message)
+    } elseif ($ExitCode -gt 1) {
+      throw "rg failed while checking $RelativePath"
+    }
+    return
+  }
+
+  try {
+    $Candidates = if (Test-Path -LiteralPath $Path -PathType Leaf) {
+      @(Get-Item -LiteralPath $Path)
+    } else {
+      @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force | Where-Object {
+        $_.FullName -notmatch '[\\/](node_modules|target|dist)[\\/]'
+      })
+    }
+    $PatternMatches = @($Candidates | Select-String -Pattern $Pattern -CaseSensitive)
+  } catch {
+    throw "regex failed while checking $RelativePath`: $($_.Exception.Message)"
+  }
+  if ($PatternMatches.Count -gt 0) {
+    $PatternMatches | ForEach-Object { Write-Host $_ }
     $Violations.Add($Message)
-  } elseif ($LASTEXITCODE -gt 1) {
-    throw "rg failed while checking $RelativePath"
   }
 }
 
