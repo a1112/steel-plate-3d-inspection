@@ -2001,7 +2001,15 @@ mod tests {
         {
             Ok(loaded) => loaded,
             Err(error) => {
-                assert!(error.contains("sick.ctiPath"), "{error}");
+                // The checked-in package points at machine-local capture assets.  A
+                // checkout without the SICK producer or replay dataset should still
+                // validate the package identity without turning that environmental
+                // prerequisite into a repository-test failure.
+                assert!(
+                    error.contains("sick.ctiPath")
+                        || error.contains("simulation sourceRoot"),
+                    "{error}"
+                );
                 return;
             }
         };
